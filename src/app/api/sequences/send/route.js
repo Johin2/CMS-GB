@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
-import { db, cuid, nowISO } from "@lib/sqlite";
-import { fillTokens } from "@lib/tokens";
+import { db, cuid, nowISO } from "../../../../lib/sqlite";
+import { fillTokens } from "../../../../lib/tokens";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";

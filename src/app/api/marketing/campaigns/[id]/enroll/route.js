@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
-import { enrollContacts, ensureMarketingSchema } from "@lib/marketing";
-import { db } from "@lib/sqlite";
+import { enrollContacts, ensureMarketingSchema } from "../../../../lib/marketing";
+import { db } from "../../../../lib/sqlite";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
