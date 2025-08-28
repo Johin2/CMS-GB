@@ -1,8 +1,8 @@
 // src/app/api/cron/leads-weekly/route.ts
 import { NextResponse } from "next/server";
-import { db, cuid, nowISO } from "../../../../lib/sqlite";
-import { fetchApolloLeadsByDomain } from "../../../../lib/apollo";
-import { aiScoreLead } from "../../../../lib/ai";
+import { db, cuid, nowISO } from "../../../lib/sqlite";
+import { fetchApolloLeadsByDomain } from "../../../lib/apollo";
+import { aiScoreLead } from "../../../lib/ai";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";

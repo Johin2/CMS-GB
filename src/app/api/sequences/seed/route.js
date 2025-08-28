@@ -1,6 +1,6 @@
 // src/app/api/sequences/seed/route.js
 import { NextResponse } from "next/server";
-import { db, cuid, nowISO } from "../../../../lib/sqlite";
+import { db, cuid, nowISO } from "../../../lib/sqlite";
 
 // Tolerant import: if the module or export is missing, we'll fallback below.
 let TPL = {};

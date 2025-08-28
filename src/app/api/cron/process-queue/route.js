@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
-import { db, nowISO, cuid } from "@lib/sqlite";
-import { sendEmailViaResend } from "@lib/email";
-import { fillTokens } from "@lib/tokens";
+import { db, nowISO, cuid } from "../../../lib/sqlite";
+import { sendEmailViaResend } from "../../../lib/email";
+import { fillTokens } from "../../../lib/tokens";
 
 export const runtime = "nodejs";       // Resend SDK requires Node runtime
 export const dynamic = "force-dynamic";

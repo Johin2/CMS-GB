@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import path from "node:path";
 import fs from "node:fs/promises";
-import { cuid } from "../../../../lib/sqlite"; // you already have cuid there
+import { cuid } from "../../../lib/sqlite"; // you already have cuid there
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
