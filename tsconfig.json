@@ -1,12 +1,9 @@
 {
   "compilerOptions": {
     "target": "ES2022",
-    "lib": [
-      "dom",
-      "dom.iterable",
-      "es2022"
-    ],
-    "allowJs": false,
+    "lib": ["dom", "dom.iterable", "es2022"],
+    "baseUrl": ".",
+    "allowJs": true,
     "skipLibCheck": true,
     "strict": true,
     "forceConsistentCasingInFileNames": true,
@@ -19,27 +16,19 @@
     "jsx": "preserve",
     "incremental": true,
     "paths": {
-      "@/*": ["./src/*"],
-      "@lib/*": [
-        "./src/lib/*"
-      ],
-      "@components/*": [
-        "./src/components/*"
-      ]
+      "@/*": ["src/*"],
+      "@lib/*": ["src/lib/*"],
+      "@components/*": ["src/components/*"]
     },
-    "plugins": [
-      {
-        "name": "next"
-      }
-    ]
+    "plugins": [{ "name": "next" }]
   },
   "include": [
     "next-env.d.ts",
+    ".next/types/**/*.ts",
     "**/*.ts",
     "**/*.tsx",
-    ".next/types/**/*.ts"
-, "src/app/api/cron/process-queue/route.js", "src/app/api/cron/leads-weekly/route.js", "src/app/api/sequences/send/route.js", "src/app/api/tracked-companies/route.js", "src/app/api/cron/relationships-monthly/route.js", "src/app/sequences/page.jsx", "src/app/contacts/page.jsx", "src/app/layout.jsx", "src/lib/sqlite.js", "src/lib/templates.js", "src/lib/tokens.js", "src/app/api/apollo/find-by-company/route.js", "src/lib/news.js", "src/lib/db.js", "src/app/api/news/sync-range/route.js", "src/app/api/news/sync-weekly/route.js", "src/app/api/news/route.ts", "src/app/api/news/news-outreach/route.js"  ],
-  "exclude": [
-    "node_modules"
-  ]
+    "**/*.js",
+    "**/*.jsx"
+  ],
+  "exclude": ["node_modules", ".next"]
 }
