@@ -1,6 +1,8 @@
 # backend/app/api/routes/news.py
+from __future__ import annotations
+
 from datetime import date, datetime, timedelta
-from typing import List, Optional, Callable, Dict
+from typing import List, Optional, Callable, Dict, Tuple
 import json
 import os
 import asyncio
@@ -18,8 +20,8 @@ from app.crud.movement import get_by_url, create, list_recent
 
 # Manual overrides (user edits)
 from app.crud.override import (
-    get_by_url as get_override_by_url,    # kept for compatibility (unused now)
-    list_all as list_overrides_all,       # used to prefetch all overrides (faster)
+    get_by_url as get_override_by_url,  # kept for compatibility (unused now)
+    list_all as list_overrides_all,     # used to prefetch all overrides (faster)
 )
 
 # People-spotting utilities
@@ -68,6 +70,7 @@ router = APIRouter(prefix="/news")
 # Funding cache & schedule
 # =======================
 USE_FUNDING_CACHE = str(os.getenv("FUNDING_CACHE_ENABLED", "1")).lower() in {"1", "true", "yes", "on"}
+FUNDING_CACHE_WARM_ON_START = str(os.getenv("FUNDING_CACHE_WARM_ON_START", "0")).lower() in {"1", "true", "yes", "on"}
 # Monday refresh time (UTC)
 FUNDING_CACHE_UTC_HOUR = int(os.getenv("FUNDING_CACHE_UTC_HOUR", "6"))     # 06:00 UTC
 FUNDING_CACHE_UTC_MIN  = int(os.getenv("FUNDING_CACHE_UTC_MINUTE", "0"))
@@ -78,6 +81,7 @@ FUNDING_CACHE: dict = {
     "built_at": None,       # datetime | None (UTC)
 }
 _funding_task: Optional[asyncio.Task] = None
+
 
 def _seconds_until_next_monday(hour: int, minute: int) -> float:
     now = datetime.utcnow()
@@ -90,11 +94,14 @@ def _seconds_until_next_monday(hour: int, minute: int) -> float:
         target = target + timedelta(days=days_ahead)
     return max(1.0, (target - now).total_seconds())
 
+
 async def _rebuild_funding_cache() -> None:
     """
     Rebuilds the raw funding cache for the last 30 days (UTC).
     We don't parse here; the endpoints will parse + filter as usual.
     """
+    if not USE_FUNDING_CACHE:
+        return
     try:
         start_dt = datetime.utcnow() - timedelta(days=30)
         end_dt   = datetime.utcnow() + timedelta(days=1)
@@ -108,29 +115,34 @@ async def _rebuild_funding_cache() -> None:
     except Exception:
         logger.exception("[news] funding_cache: rebuild failed")
 
+
 async def _funding_refresh_loop() -> None:
     """
     Runs forever: waits until the next Monday hh:mm UTC, rebuilds, repeats weekly.
-    On startup it also warms the cache once (so the table is ready immediately).
+    Optionally warms the cache at startup if FUNDING_CACHE_WARM_ON_START=1.
     """
-    # warm once at startup (non-blocking to app because this runs in its own task)
-    await _rebuild_funding_cache()
+    if FUNDING_CACHE_WARM_ON_START:
+        await _rebuild_funding_cache()
+
     while True:
         try:
             to_sleep = _seconds_until_next_monday(FUNDING_CACHE_UTC_HOUR, FUNDING_CACHE_UTC_MIN)
             await asyncio.sleep(to_sleep)
             await _rebuild_funding_cache()
         except asyncio.CancelledError:
-            # graceful shutdown without noisy traceback
             logger.info("[news] funding_cache: background loop cancelled")
             return
         except Exception:
             logger.exception("[news] funding_cache: loop error, continuing...")
 
-async def start_funding_refresh_background() -> None:
+
+async def start_funding_refresh_background(launch_now: bool = False) -> None:
     """
     Called from main.py on startup to launch the Monday auto-refresh loop.
     Safe to call multiple times (noop if already started).
+
+    launch_now=False -> do NOT rebuild immediately (prevents surprise work on cold-start).
+    Set FUNDING_CACHE_WARM_ON_START=1 env if you want a warm cache on boot.
     """
     if not USE_FUNDING_CACHE:
         logger.info("[news] funding_cache: disabled by env")
@@ -138,15 +150,18 @@ async def start_funding_refresh_background() -> None:
     global _funding_task
     if _funding_task and not _funding_task.done():
         return
-    # create task on the running loop
     _funding_task = asyncio.create_task(_funding_refresh_loop())
-    logger.info("[news] funding_cache: background loop started (Mon %02d:%02d UTC)",
-                FUNDING_CACHE_UTC_HOUR, FUNDING_CACHE_UTC_MIN)
+    logger.info(
+        "[news] funding_cache: loop started (Mon %02d:%02d UTC) warm_on_start=%s",
+        FUNDING_CACHE_UTC_HOUR, FUNDING_CACHE_UTC_MIN, FUNDING_CACHE_WARM_ON_START
+    )
+    # Optional explicit warm trigger
+    if launch_now and not FUNDING_CACHE_WARM_ON_START:
+        await _rebuild_funding_cache()
+
 
 async def stop_funding_refresh_background() -> None:
-    """
-    Cancel and await the background task on shutdown to avoid CancelledError surfacing.
-    """
+    """Cancel and await the background task on shutdown to avoid CancelledError surfacing."""
     global _funding_task
     if _funding_task:
         _funding_task.cancel()
@@ -170,6 +185,7 @@ def _as_datetime(v: Optional[object]) -> Optional[datetime]:
         return datetime(v.year, v.month, v.day)
     return None
 
+
 def _as_date(v: Optional[object]) -> Optional[date]:
     if v is None:
         return None
@@ -179,6 +195,7 @@ def _as_date(v: Optional[object]) -> Optional[date]:
         return v.date()
     return None
 
+
 def _format_day_mon_year(dt: datetime | date) -> str:
     """16-Jan-25 (no leading zero on day)."""
     if isinstance(dt, datetime):
@@ -187,11 +204,13 @@ def _format_day_mon_year(dt: datetime | date) -> str:
         d = dt
     return f"{d.day}-{d.strftime('%b')}-{d.strftime('%y')}"
 
+
 def _clean(s: Optional[str]) -> Optional[str]:
     if not s:
         return None
     t = s.strip().strip("—–-: ")
     return t or None
+
 
 def _strip_possessive(name: Optional[str]) -> Optional[str]:
     """Remove leading brand possessives, e.g. 'Netflix’s Akash Iyer' -> 'Akash Iyer'."""
@@ -203,6 +222,7 @@ def _strip_possessive(name: Optional[str]) -> Optional[str]:
             return name[pos + len(tok):].strip()
     return name
 
+
 # columns compatibility helpers (captured_at may not exist in your model)
 def _max_col(db: Session, col_name: str):
     """Return MAX(Movement.<col>) if the column exists, else None."""
@@ -210,6 +230,7 @@ def _max_col(db: Session, col_name: str):
     if col is None:
         return None
     return db.query(func.max(col)).scalar()
+
 
 def _row_created_like(r) -> Optional[datetime]:
     """Prefer captured_at, else created_at, else created (whichever exists)."""
@@ -219,9 +240,6 @@ def _row_created_like(r) -> Optional[datetime]:
         or getattr(r, "created", None)
     )
 
-def _dt_key(dtobj: Optional[datetime]) -> tuple:
-    # For sorting: place None at bottom, newest first
-    return (dtobj is None, dtobj or datetime.min)
 
 def _strip_descriptor_prefix(s: str) -> str:
     """
@@ -268,6 +286,7 @@ def _strip_descriptor_prefix(s: str) -> str:
             return after
 
     return s
+
 
 # ---------- rules-only parser ----------
 def _parse_people_title_rules(title: str) -> dict:
@@ -590,6 +609,7 @@ def _parse_people_title_rules(title: str) -> dict:
     out["name"] = _strip_possessive(_strip_descriptor_prefix_local(_clean(t)))
     return out
 
+
 # ---------- LLM fallback (only if needed) ----------
 _LLM_SYS = (
     "Extract name, company, and designation from a single news headline about a people movement. "
@@ -621,6 +641,7 @@ def _extract_json(text: str) -> Optional[dict]:
         return None
     return None
 
+
 def _parse_people_title_llm(title: str) -> Optional[dict]:
     if not (USE_LLM and _openai_client):
         return None
@@ -648,6 +669,7 @@ def _parse_people_title_llm(title: str) -> Optional[dict]:
     except Exception:
         return None
 
+
 def _parse_people_title(title: str) -> dict:
     base = _parse_people_title_rules(title)
     if not (base.get("name") and base.get("company") and base.get("designation")):
@@ -659,6 +681,7 @@ def _parse_people_title(title: str) -> dict:
     base["name"] = _strip_possessive(base.get("name"))
     return base
 
+
 def _parse_date_only(s: Optional[str]) -> Optional[datetime]:
     if not s:
         return None
@@ -667,6 +690,7 @@ def _parse_date_only(s: Optional[str]) -> Optional[datetime]:
         return datetime(d.year, d.month, d.day)
     except Exception:
         return None
+
 
 # --------------------------
 # override merge helpers
@@ -689,6 +713,7 @@ def _apply_flat_override(flat: "NewsFlatItem", ov) -> "NewsFlatItem":
         flat.month       = ov.month       or flat.month
     return flat
 
+
 def _apply_newsitem_override(item: "NewsItem", ov) -> "NewsItem":
     if not ov:
         return item
@@ -700,10 +725,10 @@ def _apply_newsitem_override(item: "NewsItem", ov) -> "NewsItem":
         item.role        = ov.designation or item.role
     return item
 
+
 # --------------------------
 # auto-sync helpers & routes
 # --------------------------
-
 def _latest_basis_datetime(db: Session) -> Optional[datetime]:
     """Newest of published_at vs (captured_at/created_at/created)."""
     latest_pub = _max_col(db, "published_at")
@@ -718,6 +743,7 @@ def _latest_basis_datetime(db: Session) -> Optional[datetime]:
         return max(lp, lc)
     return lp or lc
 
+
 @router.get("/auto_sync_status", response_model=dict)
 def auto_sync_status(db: Session = Depends(get_db)):
     latest = _latest_basis_datetime(db)
@@ -727,6 +753,7 @@ def auto_sync_status(db: Session = Depends(get_db)):
         "days_since": ((datetime.utcnow() - latest).days if latest else None),
         "total": total,
     }
+
 
 @router.post("/auto_sync_now", response_model=dict)
 def auto_sync_now(
@@ -770,11 +797,15 @@ def auto_sync_now(
         "total": total,
     }
 
+
 # --------------------------
 # default range helper
 # --------------------------
-
-def _apply_default_range_if_missing(start_dt: Optional[datetime], end_dt: Optional[datetime], days: int = 30) -> tuple[Optional[datetime], Optional[datetime]]:
+def _apply_default_range_if_missing(
+    start_dt: Optional[datetime],
+    end_dt: Optional[datetime],
+    days: int = 30
+) -> tuple[Optional[datetime], Optional[datetime]]:
     """
     If both start_dt and end_dt are None, set a default window of the last `days` days.
     end_dt is set to tomorrow (exclusive upper bound).
@@ -785,10 +816,10 @@ def _apply_default_range_if_missing(start_dt: Optional[datetime], end_dt: Option
         end_dt = today_utc + timedelta(days=1)
     return start_dt, end_dt
 
+
 # --------------------------
 # routes
 # --------------------------
-
 @router.get("", response_model=dict)
 def list_news(
     from_date: Optional[str] = Query(None, alias="from"),
@@ -818,6 +849,7 @@ def list_news(
     rows = list_recent(db, limit=5000)
 
     items: List[NewsItem] = []
+
     # ---- People Spotting (DB) ----
     for r in rows:
         if not is_positive_movement(r.title or ""):
@@ -857,7 +889,6 @@ def list_news(
         items.append(_apply_newsitem_override(item, ov))
 
     # ---- Funding (feeds) ----
-    # Prefer cache if available; otherwise live fetch
     funding = None
     if USE_FUNDING_CACHE and isinstance(FUNDING_CACHE.get("raw"), list):
         funding = FUNDING_CACHE["raw"]
@@ -907,9 +938,16 @@ def list_news(
         ov = ov_map.get(it.get("url") or "")
         items.append(_apply_newsitem_override(item, ov))
 
-    items.sort(key=lambda x: (x.published_at is None, x.published_at), reverse=True)
+    # Newest → oldest using datetime
+    items.sort(key=lambda x: (x.published_at is None, x.published_at or datetime.min), reverse=True)
     stats = get_funding_parse_stats(reset=True)
-    return {"items": [i.dict() for i in items], "fallback_used": USE_LLM, "funding_parse_stats": stats}
+    # include window for debugging
+    window = {
+        "from": (start_dt.date().isoformat() if start_dt else None),
+        "to": ( (end_dt - timedelta(days=1)).date().isoformat() if end_dt else None ),
+    }
+    return {"items": [i.dict() for i in items], "fallback_used": USE_LLM, "funding_parse_stats": stats, "window": window}
+
 
 @router.get("/sync", response_model=dict)
 def sync_news(
@@ -942,6 +980,7 @@ def sync_news(
         "cutoff": cutoff.isoformat(),
     }
 
+
 @router.get("/sync_all", response_model=dict)
 def sync_all(
     start_page: int = Query(1, description="First listing page to scan"),
@@ -970,6 +1009,7 @@ def sync_all(
         "start_page": start_page,
         "scanned_pages": max_pages,
     }
+
 
 @router.get("/sync_range", response_model=dict)
 def sync_range(
@@ -1018,6 +1058,7 @@ def sync_range(
         "scanned_pages": max_pages,
     }
 
+
 @router.get("/outreach", response_model=dict)
 def outreach_stub(
     days: int = 7,
@@ -1040,6 +1081,7 @@ def outreach_stub(
         "message": "Outreach endpoint is a stub in this starter backend.",
     }
 
+
 @router.get("/table", response_model=dict)
 def get_news_table(
     from_date: Optional[str] = Query(None, alias="from"),
@@ -1059,13 +1101,14 @@ def get_news_table(
     if end_dt:
         end_dt = end_dt + timedelta(days=1)
 
-    # ✅ enforce 30-day default
+    # ✅ enforce 30-day default on the server
     start_dt, end_dt = _apply_default_range_if_missing(start_dt, end_dt, days=30)
 
     # Prefetch all overrides once (fast merge by URL)
     ov_map: Dict[str, object] = {o.url: o for o in list_overrides_all(db, limit=10000)}
 
-    out: List[NewsFlatItem] = []
+    # We'll collect tuples of (basis_dt, row) so we can sort by real datetime at the end
+    table_with_keys: List[Tuple[Optional[datetime], NewsFlatItem]] = []
 
     # ---- People Spotting (DB) ----
     rows = list_recent(db, limit=5000)
@@ -1097,15 +1140,16 @@ def get_news_table(
             designation=parsed.get("designation"),
             email=None,
             link=r.url,
-            date=_format_day_mon_year(basis) if basis else None,
+            date=_format_day_mon_year(basis),
             location=None,
             created_by=None,
             ambassador_featuring=parsed.get("ambassador_featuring"),
-            month=basis.strftime("%B") if basis else None,
+            month=basis.strftime("%B"),
             type="In the News",
         )
         ov = ov_map.get(r.url or "")
-        out.append(_apply_flat_override(row, ov))
+        row = _apply_flat_override(row, ov)
+        table_with_keys.append((basis, row))
 
     # ---- Funding (feeds) ----
     funding = None
@@ -1162,11 +1206,20 @@ def get_news_table(
             investors=parsed.investors,
         )
         ov = ov_map.get(it.get("url") or "")
-        out.append(_apply_flat_override(row, ov))
+        row = _apply_flat_override(row, ov)
+        table_with_keys.append((pub_dt, row))
 
-    out.sort(key=lambda r: (r.date is None, r.date), reverse=True)
+    # Newest → oldest using proper datetime key
+    table_with_keys.sort(key=lambda t: (t[0] is None, t[0] or datetime.min), reverse=True)
+    out = [row for _, row in table_with_keys]
+
     stats = get_funding_parse_stats(reset=True)
-    return {"items": [i.dict() for i in out], "funding_parse_stats": stats}
+    window = {
+        "from": (start_dt.date().isoformat() if start_dt else None),
+        "to": ( (end_dt - timedelta(days=1)).date().isoformat() if end_dt else None ),
+    }
+    return {"items": [i.dict() for i in out], "funding_parse_stats": stats, "window": window}
+
 
 @router.post("/purge_negatives", response_model=dict)
 def purge_negatives(db: Session = Depends(get_db)):
