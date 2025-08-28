@@ -1,6 +1,6 @@
 // src/app/api/cron/relationships-monthly/route.ts
 import { NextRequest, NextResponse } from "next/server";
-import { db, nowISO, cuid } from "../../../lib/sqlite"; // adjust path alias if needed
+import { db, nowISO, cuid } from "@lib/sqlite"; // adjust path alias if needed
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";

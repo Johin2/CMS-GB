@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { ensureMarketingSchema, createCampaign, listCampaigns } from "../../../lib/marketing";
+import { ensureMarketingSchema, createCampaign, listCampaigns } from "@lib/marketing";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";

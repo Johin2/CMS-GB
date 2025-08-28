@@ -1,9 +1,9 @@
 // src/app/api/cron/news-outreach/route.js
 import { NextRequest, NextResponse } from "next/server";
-import { db, cuid, nowISO } from "../../../lib/sqlite";
-import { fetchApolloContactByNameCompany } from "../../../lib/apollo";
-import { sendEmailViaResend } from "../../../lib/email"; // <-- uses Resend SDK inside
-import { generatePersonalizedEmail } from "../../../lib/personalize";
+import { db, cuid, nowISO } from "@lib/sqlite";
+import { fetchApolloContactByNameCompany } from "@lib/apollo";
+import { sendEmailViaResend } from "@lib/email"; // <-- uses Resend SDK inside
+import { generatePersonalizedEmail } from "@lib/personalize";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";

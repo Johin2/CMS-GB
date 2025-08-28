@@ -1,6 +1,6 @@
 // src/app/api/emails/outbox/stats/route.js
 import { NextResponse } from "next/server";
-import { db } from "../../../lib/sqlite";
+import { db } from "@lib/sqlite";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
