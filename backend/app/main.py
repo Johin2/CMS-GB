@@ -28,9 +28,9 @@ ALLOWED_ORIGINS = [VERCEL_PROD, LOCAL_DEV]
 # CORS — set your real frontend domains here
 app.add_middleware(
     CORSMiddleware,
-    allow_origins = ALLOWED_ORIGINS,
-    allow_credentials=True,
-    allow_methods=["*"],
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=False,  # set True only if you use cookies/auth across origins
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
 
