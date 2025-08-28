@@ -9,7 +9,7 @@ import logging
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from dateutil import parser as dateparse
-from sqlalchemy import func, or_, and_
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.db.session import get_db
@@ -20,7 +20,7 @@ except Exception:
 
 from app.models.movement import Movement
 from app.schemas.news import NewsItem, NewsFlatItem
-from app.crud.movement import get_by_url, create
+from app.crud.movement import get_by_url, create, list_recent
 
 from app.crud.override import (
     list_all as list_overrides_all,
@@ -35,9 +35,9 @@ from app.services.scraper.funding_parse import (
     begin_funding_parse_request,
 )
 
+# Optional range-capable funding fetcher
 try:
-    # expected signature:
-    # fetch_funding_items_range(start_dt: Optional[datetime], end_dt: Optional[datetime], max_pages: int = 200) -> List[dict]
+    # fetch_funding_items_range(start_dt, end_dt, max_pages=...)
     from app.services.scraper.funding_rss import fetch_funding_items_range as _fetch_funding_items_range  # type: ignore
 except Exception:
     _fetch_funding_items_range: Optional[Callable[..., List[dict]]] = None
@@ -81,80 +81,7 @@ PEOPLE_BACKFILL_MAX_PAGES = int(os.getenv("PEOPLE_BACKFILL_MAX_PAGES", "600"))
 _people_task: Optional[asyncio.Task] = None
 
 
-def _seconds_until_next_monday(hour: int, minute: int) -> float:
-    now = datetime.utcnow()
-    # Monday is 0
-    days_ahead = (0 - now.weekday()) % 7
-    target = datetime(now.year, now.month, now.day, hour, minute)
-    if days_ahead == 0 and target <= now:
-        days_ahead = 7
-    if days_ahead > 0:
-        target = target + timedelta(days=days_ahead)
-    return max(1.0, (target - now).total_seconds())
-
-
-async def _rebuild_funding_cache() -> None:
-    """
-    Rebuilds the raw funding cache for the last 30 days (UTC).
-    """
-    if not USE_FUNDING_CACHE:
-        return
-    try:
-        start_dt = datetime.utcnow() - timedelta(days=30)
-        end_dt   = datetime.utcnow() + timedelta(days=1)
-        if _fetch_funding_items_range:
-            raw = _fetch_funding_items_range(start_dt, end_dt)
-        else:
-            raw = fetch_funding_items()
-        FUNDING_CACHE["raw"] = raw or []
-        FUNDING_CACHE["built_at"] = datetime.utcnow()
-        logger.info("[news] funding_cache: rebuilt items=%s", len(FUNDING_CACHE["raw"]))
-    except Exception:
-        logger.exception("[news] funding_cache: rebuild failed")
-
-
-async def _funding_refresh_loop() -> None:
-    if FUNDING_CACHE_WARM_ON_START:
-        await _rebuild_funding_cache()
-    while True:
-        try:
-            await asyncio.sleep(_seconds_until_next_monday(FUNDING_CACHE_UTC_HOUR, FUNDING_CACHE_UTC_MIN))
-            await _rebuild_funding_cache()
-        except asyncio.CancelledError:
-            logger.info("[news] funding_cache: background loop cancelled")
-            return
-        except Exception:
-            logger.exception("[news] funding_cache: loop error, continuing...")
-
-
-async def start_funding_refresh_background(launch_now: bool = False) -> None:
-    if not USE_FUNDING_CACHE:
-        logger.info("[news] funding_cache: disabled by env")
-        return
-    global _funding_task
-    if _funding_task and not _funding_task.done():
-        return
-    _funding_task = asyncio.create_task(_funding_refresh_loop())
-    logger.info(
-        "[news] funding_cache: loop started (Mon %02d:%02d UTC) warm_on_start=%s",
-        FUNDING_CACHE_UTC_HOUR, FUNDING_CACHE_UTC_MIN, FUNDING_CACHE_WARM_ON_START
-    )
-    if launch_now and not FUNDING_CACHE_WARM_ON_START:
-        await _rebuild_funding_cache()
-
-
-async def stop_funding_refresh_background() -> None:
-    global _funding_task
-    if _funding_task:
-        _funding_task.cancel()
-        try:
-            await _funding_task
-        except asyncio.CancelledError:
-            pass
-        _funding_task = None
-
-
-# ===== helpers =====
+# ---------- small utils ----------
 def _as_datetime(v: Optional[object]) -> Optional[datetime]:
     if v is None:
         return None
@@ -176,10 +103,7 @@ def _as_date(v: Optional[object]) -> Optional[date]:
 
 
 def _format_day_mon_year(dt: datetime | date) -> str:
-    if isinstance(dt, datetime):
-        d = dt.date()
-    else:
-        d = dt
+    d = dt.date() if isinstance(dt, datetime) else dt
     return f"{d.day}-{d.strftime('%b')}-{d.strftime('%y')}"
 
 
@@ -204,7 +128,8 @@ def _max_col(db: Session, col_name: str):
     col = getattr(Movement, col_name, None)
     if col is None:
         return None
-    return db.query(func.max(col)).scalar()
+    from sqlalchemy import func as _func
+    return db.query(_func.max(col)).scalar()
 
 
 def _row_created_like(r) -> Optional[datetime]:
@@ -214,7 +139,26 @@ def _row_created_like(r) -> Optional[datetime]:
         or getattr(r, "created", None)
     )
 
-# ===== FULL rules-only people-title parser =====
+
+# ---------- (robust) funding publish date ----------
+def _funding_pub_dt(it: dict) -> Optional[datetime]:
+    """Try hard to parse a publish date from common keys."""
+    for key in ("published_at", "published", "updated", "pubDate", "date", "isoDate", "iso_date", "created", "timestamp"):
+        v = it.get(key)
+        if isinstance(v, datetime):
+            return datetime(v.year, v.month, v.day)
+        if isinstance(v, date):
+            return datetime(v.year, v.month, v.day)
+        if isinstance(v, str):
+            try:
+                d = dateparse.parse(v)
+                return datetime(d.year, d.month, d.day)
+            except Exception:
+                continue
+    return None
+
+
+# ---------- people parser (rules + optional LLM fallback) ----------
 def _strip_descriptor_prefix(s: str) -> str:
     s = _clean(s)
     if not s:
@@ -249,13 +193,11 @@ def _strip_descriptor_prefix(s: str) -> str:
             return after
     return s
 
+
 def _parse_people_title_rules(title: str) -> dict:
     out = {"name": None, "company": None, "designation": None, "ambassador_featuring": None}
     if not title:
         return out
-
-    def _strip_descriptor_prefix_local(s: str) -> str:
-        return _strip_descriptor_prefix(s)
 
     def _split_trailing_company(rest: str):
         txt = _clean(rest).strip(" ,")
@@ -266,13 +208,13 @@ def _parse_people_title_rules(title: str) -> dict:
         if n == 0:
             return "", ""
         org_suffixes = {
-            "media", "group", "holdings", "limited", "ltd", "inc", "llc", "llp", "plc",
-            "network", "networks", "studios", "agency", "agencies", "communications",
-            "company", "co.", "corp", "corporation", "enterprises", "solutions", "systems"
+            "media","group","holdings","limited","ltd","inc","llc","llp","plc",
+            "network","networks","studios","agency","agencies","communications",
+            "company","co.","corp","corporation","enterprises","solutions","systems"
         }
         role_words = {
-            "president", "chief", "cso", "ceo", "cfo", "coo", "cmo", "cio", "cto", "chairman",
-            "vice", "vp", "director", "head", "lead", "officer", "partner", "manager"
+            "president","chief","cso","ceo","cfo","coo","cmo","cio","cto","chairman",
+            "vice","vp","director","head","lead","officer","partner","manager"
         }
         i = n - 1
         company_tokens = []
@@ -281,7 +223,7 @@ def _parse_people_title_rules(title: str) -> dict:
             while i >= 0:
                 tok = tokens[i].strip(",")
                 low = tok.lower()
-                if low in role_words or low in {"&", "and"} or tok in {"–", "-", "/"}:
+                if low in role_words or low in {"&","and"} or tok in {"–","-","/"}:
                     break
                 if tok[:1].isupper() or tok.isupper():
                     company_tokens.insert(0, tokens[i])
@@ -289,7 +231,7 @@ def _parse_people_title_rules(title: str) -> dict:
                     continue
                 break
             company = _clean(" ".join(company_tokens)).strip()
-            designation = _clean(" ".join(tokens[:i + 1])).strip(" ,–-")
+            designation = _clean(" ".join(tokens[:i+1])).strip(" ,–-")
             if company and designation:
                 return designation, company
         return txt, ""
@@ -312,13 +254,13 @@ def _parse_people_title_rules(title: str) -> dict:
         pat = "'s role to "
         if pat in low_rest:
             k = low_rest.find(pat)
-            name = _strip_possessive(_strip_descriptor_prefix_local(_clean(rest[:k])))
+            name = _strip_possessive(_clean(rest[:k]))
             designation = _clean(rest[k + len(pat):])
         elif " the role of " in low_rest and " to " in low_rest:
             a = low_rest.find(" the role of ")
             b = low_rest.find(" to ", a + len(" the role of "))
             if b != -1:
-                name = _strip_possessive(_strip_descriptor_prefix_local(_clean(rest[a + len(" the role of "): b])))
+                name = _strip_possessive(_clean(rest[a + len(" the role of "): b]))
                 designation = _clean(rest[b + len(" to "):])
         if company and name and designation:
             out.update({"company": company, "name": name, "designation": designation})
@@ -327,8 +269,7 @@ def _parse_people_title_rules(title: str) -> dict:
     if " joins " in low and " as " in low:
         i = low.find(" joins ")
         j = low.find(" as ", i + 7)
-        left = _clean(t[:i])
-        out["name"] = _strip_possessive(_strip_descriptor_prefix_local(left))
+        out["name"] = _strip_possessive(_clean(t[:i]))
         out["company"] = _clean(t[i + 7:j])
         out["designation"] = _clean(t[j + 4:])
         return out
@@ -345,11 +286,11 @@ def _parse_people_title_rules(title: str) -> dict:
                 if sep in low_rest:
                     j = low_rest.find(sep)
                     left = _clean(rest[:j])
-                    name = _strip_possessive(_strip_descriptor_prefix_local(left))
+                    name = _strip_possessive(_clean(left))
                     designation = _clean(rest[j + add_len:])
                     break
             if name is None:
-                name = _strip_possessive(_strip_descriptor_prefix_local(_clean(rest)))
+                name = _strip_possessive(_clean(rest))
             out.update({"company": company, "name": name, "designation": designation})
             return out
 
@@ -365,7 +306,7 @@ def _parse_people_title_rules(title: str) -> dict:
                 k = low_rest.find(sep)
                 if k != -1:
                     left = _clean(rest[:k])
-                    name = _strip_possessive(_strip_descriptor_prefix_local(left))
+                    name = _strip_possessive(_clean(left))
                     rhs = rest[k + add:].strip()
                     if (" at " in rhs.lower()) or (" of " in rhs.lower()):
                         rl = rhs.lower()
@@ -384,7 +325,7 @@ def _parse_people_title_rules(title: str) -> dict:
                         out.update({"company": company_rhs if company_rhs else company, "name": name, "designation": designation})
                         return out
             if name is None:
-                name = _strip_possessive(_strip_descriptor_prefix_local(_clean(rest)))
+                name = _strip_possessive(_clean(rest))
             out.update({"company": company, "name": name, "designation": designation})
             return out
 
@@ -392,7 +333,7 @@ def _parse_people_title_rules(title: str) -> dict:
         if verb in low:
             i = low.find(verb)
             left = _clean(t[:i])
-            name = _strip_possessive(_strip_descriptor_prefix_local(left))
+            name = _strip_possessive(_clean(left))
             rhs = t[i + len(verb):].strip()
             rl = rhs.lower()
             if " at " in rl:
@@ -407,136 +348,21 @@ def _parse_people_title_rules(title: str) -> dict:
                 out["company"] = _clean(rhs[k + 4:])
                 out["name"] = name
                 return out
-            designation, company_rhs = _split_trailing_company(rhs)
-            if designation:
-                out["designation"] = designation
-            if company_rhs:
-                out["company"] = company_rhs
+            # fallback split
+            designation = _clean(rhs)
+            out["designation"] = designation
             out["name"] = name
             return out
 
-    if " appointed as " in low and "'s " in low:
-        i = low.find(" appointed as ")
-        name = _strip_possessive(_strip_descriptor_prefix_local(_clean(t[:i])))
-        rest = t[i + len(" appointed as "):]
-        rl = rest.lower()
-        k = rl.find("'s ")
-        if k != -1:
-            company = _clean(rest[:k])
-            designation = _clean(rest[k + 3:])
-            out.update({"name": name, "company": company, "designation": designation})
-            return out
-
-    if " appointed " in low and " of " in low:
-        i = low.find(" appointed ")
-        name = _strip_possessive(_strip_descriptor_prefix_local(_clean(t[:i])))
-        rest = t[i + len(" appointed "):]
-        j = rest.lower().rfind(" of ")
-        if j != -1:
-            designation = _clean(rest[:j]).rstrip(",")
-            company = _clean(rest[j + 4:])
-            out.update({"name": name, "company": company, "designation": designation})
-            return out
-
-    if " appointed " in low:
-        i = low.find(" appointed ")
-        name = _strip_possessive(_strip_descriptor_prefix_local(_clean(t[:i])))
-        rest = t[i + len(" appointed "):].strip()
-        low_rest = rest.lower()
-        if " at " in low_rest:
-            j = low_rest.rfind(" at ")
-            designation = _clean(rest[:j]).rstrip(",")
-            company = _clean(rest[j + 4:])
-        elif " of " in low_rest:
-            j = low_rest.rfind(" of ")
-            designation = _clean(rest[:j]).rstrip(",")
-            company = _clean(rest[j + 4:])
-        else:
-            designation, company = _split_trailing_company(rest)
-        out.update({"name": name, "company": company, "designation": designation})
-        return out
-
-    if " named " in low:
-        i = low.find(" named ")
-        name = _strip_possessive(_strip_descriptor_prefix_local(_clean(t[:i])))
-        rest = t[i + len(" named "):].strip()
-        low_rest = rest.lower()
-        if " for " in low_rest:
-            k = low_rest.find(" for ")
-            designation = _clean(rest[:k]).rstrip(",")
-            company = _clean(rest[k + 5:])
-        elif " at " in low_rest:
-            k = low_rest.find(" at ")
-            designation = _clean(rest[:k]).rstrip(",")
-            company = _clean(rest[k + 4:])
-        else:
-            designation, company = _split_trailing_company(rest)
-        out.update({"name": name, "company": company, "designation": designation})
-        return out
-
-    if " to head " in low:
-        i = low.find(" to head ")
-        rest = t[i + len(" to head "):]
-        rl = rest.lower()
-        if " at " in rl:
-            k = rl.find(" at ")
-            out["designation"] = _clean("Head " + rest[:k])
-            out["company"] = _clean(rest[k + 4:])
-        else:
-            ks = rl.find("'s ")
-            if 0 < ks <= 24:
-                out["company"] = _clean(rest[:ks])
-                out["designation"] = _clean("Head " + rest[ks + 3:])
-            else:
-                desig, comp = _split_trailing_company(rest)
-                out["designation"] = _clean("Head " + desig) if desig else _clean("Head " + rest)
-                if comp:
-                    out["company"] = comp
-        out["name"] = _strip_possessive(_strip_descriptor_prefix_local(_clean(t[:i])))
-        return out
-
-    if " to lead " in low:
-        i = low.find(" to lead ")
-        rest = t[i + len(" to lead "):]
-        rl = rest.lower()
-        if " at " in rl:
-            k = rl.find(" at ")
-            out["designation"] = _clean("Lead " + rest[:k])
-            out["company"] = _clean(rest[k + 4:])
-        else:
-            desig, comp = _split_trailing_company(rest)
-            out["designation"] = _clean("Lead " + desig) if desig else _clean("Lead " + rest)
-            if comp:
-                out["company"] = comp
-        out["name"] = _strip_possessive(_strip_descriptor_prefix_local(_clean(t[:i])))
-        return out
-
-    if " takes charge as " in low:
-        i = low.find(" takes charge as ")
-        name = _strip_possessive(_strip_descriptor_prefix_local(_clean(t[:i])))
-        rest = t[i + len(" takes charge as "):]
-        rl = rest.lower()
-        company = None
-        role = rest
-        for sep in (" at ", " of "):
-            if sep in rl:
-                k = rl.find(sep)
-                role = rest[:k]
-                company = rest[k + len(sep):]
-                break
-        if company is None:
-            role, company = _split_trailing_company(rest)
-        out.update({"name": name, "company": _clean(company) if company else None, "designation": _clean(role)})
-        return out
-
     if " at " in low:
         i = low.find(" at ")
-        out["name"] = _strip_possessive(_strip_descriptor_prefix_local(_clean(t[:i])))
+        out["name"] = _strip_possessive(_clean(t[:i]))
         out["company"] = _clean(t[i + 4:])
         return out
 
-    out["name"] = _strip_possessive(_strip_descriptor_prefix_local(_clean(t)))
+    out["name"] = _strip_possessive(_clean(t))
     return out
+
 
 _LLM_SYS = (
     "Extract name, company, and designation from a single news headline about a people movement. "
@@ -606,89 +432,162 @@ def _parse_people_title(title: str) -> dict:
     base["name"] = _strip_possessive(base.get("name"))
     return base
 
-def _parse_date_only(s: Optional[str]) -> Optional[datetime]:
-    if not s:
-        return None
-    try:
-        d = dateparse.parse(s)
-        return datetime(d.year, d.month, d.day)
-    except Exception:
-        return None
+
+def _apply_default_range_if_missing(
+    start_dt: Optional[datetime],
+    end_dt: Optional[datetime],
+    days: int = 30
+) -> tuple[Optional[datetime], Optional[datetime]]:
+    """If both dates are missing, apply a last-`days` window; end_dt is tomorrow (exclusive)."""
+    if start_dt is None and end_dt is None:
+        today_utc = datetime.utcnow()
+        start_dt = today_utc - timedelta(days=days)
+        end_dt = today_utc + timedelta(days=1)
+    return start_dt, end_dt
 
 
-def _apply_flat_override(flat: "NewsFlatItem", ov) -> "NewsFlatItem":
-    if not ov:
-        return flat
-    if flat.type == "Funding":
-        flat.company   = ov.company   or flat.company
-        flat.amount    = ov.amount    or flat.amount
-        flat.round     = ov.round     or flat.round
-        flat.investors = ov.investors or flat.investors
-        flat.date      = ov.date      or flat.date
-        flat.month     = ov.month     or flat.month
-    else:
-        flat.name        = ov.name        or flat.name
-        flat.company     = ov.company     or flat.company
-        flat.designation = ov.designation or flat.designation
-        flat.date        = ov.date        or flat.date
-        flat.month       = ov.month       or flat.month
-    return flat
-
-def _apply_newsitem_override(item: "NewsItem", ov) -> "NewsItem":
-    if not ov:
-        return item
-    if item.category == "Funding":
-        item.company = ov.company or item.company
-    else:
-        item.person_name = ov.name or item.person_name
-        item.company     = ov.company or item.company
-        item.role        = ov.designation or item.role
-    return item
-
-
-def _people_rows_in_window(db: Session, start_dt: Optional[datetime], end_dt: Optional[datetime], limit: int = 20000):
+# ================== ROUTES ==================
+@router.get("", response_model=dict)
+def list_news(
+    from_date: Optional[str] = Query(None, alias="from"),
+    to_date: Optional[str] = Query(None, alias="to"),
+    q: Optional[str] = Query(None),
+    db: Session = Depends(get_db),
+):
     """
-    Fetch people rows whose published_at OR captured/created timestamps fall inside [start_dt, end_dt).
+    Combined list for cards (People + Funding).
+    Default: last 30 days if no from/to are passed.
     """
-    q = db.query(Movement)
-    conds = []
+    begin_funding_parse_request()
 
-    def _rng(col):
-        parts = []
-        if start_dt is not None:
-            parts.append(col >= start_dt)
-        if end_dt is not None:
-            parts.append(col < end_dt)
-        return and_(*parts) if parts else None
+    start_dt = _parse_date_only(from_date)
+    end_dt = _parse_date_only(to_date)
+    if end_dt:
+        end_dt = end_dt + timedelta(days=1)
+    start_dt, end_dt = _apply_default_range_if_missing(start_dt, end_dt, days=30)
 
-    for col_name in ("published_at", "captured_at", "created_at", "created"):
-        col = getattr(Movement, col_name, None)
-        if col is not None:
-            rc = _rng(col)
-            if rc is not None:
-                conds.append(rc)
+    ov_map: Dict[str, object] = {o.url: o for o in list_overrides_all(db, limit=10000)}
 
-    if conds:
-        q = q.filter(or_(*conds))
+    items: List[NewsItem] = []
 
-    return q.limit(limit).all()
+    # ---- People Spotting (load recent, then filter in Python; this path was working for you) ----
+    rows = list_recent(db, limit=20000)
+    for r in rows:
+        if not is_positive_movement(r.title or ""):
+            continue
+
+        pub = _as_datetime(getattr(r, "published_at", None))
+        cap = _as_datetime(_row_created_like(r))
+        basis = pub or cap
+        if basis is None:
+            continue
+
+        if start_dt and basis < start_dt:
+            continue
+        if end_dt and basis >= end_dt:
+            continue
+
+        if q:
+            ql = q.lower()
+            if ql not in (r.title or "").lower() and ql not in (r.url or "").lower():
+                continue
+
+        month_label = basis.strftime("%b %Y")
+        parsed = _parse_people_title(r.title or "")
+        item = NewsItem(
+            person_name=parsed.get("name"),
+            role=parsed.get("designation"),
+            company=parsed.get("company"),
+            email=None,
+            url=r.url,
+            published_at=pub,
+            created_at=cap,
+            city=None,
+            month_label=month_label,
+            category="People Spotting",
+            source=r.source,
+        )
+        ov = ov_map.get(r.url or "")
+        items.append(_apply_newsitem_override(item, ov))
+
+    # ---- Funding ----
+    if USE_FUNDING_CACHE and isinstance(FUNDING_CACHE.get("raw"), list):
+        funding = FUNDING_CACHE["raw"]
+    else:
+        if _fetch_funding_items_range and (start_dt or end_dt):
+            funding = _fetch_funding_items_range(start_dt, end_dt)
+        else:
+            funding = fetch_funding_items()
+
+    for it in funding or []:
+        pub_dt = _funding_pub_dt(it)
+
+        # Enforce window only when we have a date. If an item has no date, keep it.
+        if pub_dt:
+            if start_dt and pub_dt < start_dt:
+                continue
+            if end_dt and pub_dt >= end_dt:
+                continue
+
+        if q:
+            ql = q.lower()
+            if ql not in (it.get("title") or "").lower() and ql not in (it.get("url") or "").lower():
+                continue
+
+        parsed = parse_funding_text(it.get("title") or "", (it.get("summary") or it.get("description") or ""))
+
+        item = NewsItem(
+            person_name=None,
+            role=None,
+            company=parsed.company or _clean(it.get("company")),
+            email=None,
+            url=it.get("url"),
+            published_at=pub_dt,  # may be None
+            created_at=None,
+            city=None,
+            month_label=(pub_dt.strftime("%b %Y") if pub_dt else None),
+            category="Funding",
+            source=it.get("source") or "yourstory",
+        )
+        ov = ov_map.get(it.get("url") or "")
+        items.append(_apply_newsitem_override(item, ov))
+
+    # Newest → oldest (undated items at bottom)
+    items.sort(key=lambda x: (x.published_at is None, x.published_at or datetime.min), reverse=True)
+    stats = get_funding_parse_stats(reset=True)
+    window = {
+        "from": (start_dt.date().isoformat() if start_dt else None),
+        "to": ((end_dt - timedelta(days=1)).date().isoformat() if end_dt else None),
+    }
+    return {"items": [i.dict() for i in items], "fallback_used": USE_LLM, "funding_parse_stats": stats, "window": window}
 
 
-def _latest_basis_datetime(db: Session) -> Optional[datetime]:
+@router.get("/auto_sync_status", response_model=dict)
+def auto_sync_status(db: Session = Depends(get_db)):
     latest_pub = _max_col(db, "published_at")
     latest_cap = (
         _max_col(db, "captured_at")
         or _max_col(db, "created_at")
         or _max_col(db, "created")
     )
-    lp = _as_datetime(latest_pub)
-    lc = _as_datetime(latest_cap)
-    if lp and lc:
-        return max(lp, lc)
-    return lp or lc
+    latest = max(filter(None, [latest_pub, latest_cap])) if (latest_pub or latest_cap) else None
+    total = db.query(Movement).count()
+    return {
+        "latest": (latest.isoformat() if latest else None),
+        "days_since": ((datetime.utcnow() - latest).days if latest else None),
+        "total": total,
+    }
 
+
+# On-demand single run (also used by the hourly loop)
 def _auto_sync_once(db: Session, backstop_days: int = 14, max_pages: int = 12, start_page: int = 1) -> dict:
-    latest = _latest_basis_datetime(db)
+    latest_pub = _max_col(db, "published_at")
+    latest_cap = (
+        _max_col(db, "captured_at")
+        or _max_col(db, "created_at")
+        or _max_col(db, "created")
+    )
+    latest = max(filter(None, [latest_pub, latest_cap])) if (latest_pub or latest_cap) else None
     cutoff = latest or (datetime.utcnow() - timedelta(days=backstop_days))
 
     scraped = scrape_paginated(
@@ -709,236 +608,14 @@ def _auto_sync_once(db: Session, backstop_days: int = 14, max_pages: int = 12, s
                 added += 1
 
     total = db.query(Movement).count()
-    return {"latest_before": latest.isoformat() if latest else None,
-            "cutoff_used": cutoff.isoformat(),
-            "fetched": fetched, "considered": considered, "added": added, "total": total}
-
-def _sync_range_core(db: Session, start_dt: datetime, end_dt: datetime, max_pages: int = 600, start_page: int = 1) -> dict:
-    scraped = scrape_paginated(
-        start_page=start_page,
-        max_pages=max_pages,
-        stop_before=start_dt,
-    )
-    fetched = len(scraped)
-
-    added = 0
-    kept = 0
-    for it in scraped:
-        dt = _as_datetime(it.get("published_at"))
-        if dt and not (start_dt <= dt < end_dt):
-            continue
-        kept += 1
-        if get_by_url(db, it["url"]):
-            continue
-        create(db, title=it["title"], url=it["url"], source="afaqs", published_at=dt)
-        added += 1
-
-    total = db.query(Movement).count()
-    return {"fetched": fetched, "added": added, "considered": kept, "total": total}
-
-async def _people_refresh_loop() -> None:
-    assert SessionLocal is not None, "SessionLocal not available to run people sync loop."
-    if PEOPLE_BACKFILL_ON_START:
-        try:
-            db = SessionLocal()
-            now = datetime.utcnow()
-            start_dt = now - timedelta(days=PEOPLE_BACKFILL_DAYS)
-            await asyncio.to_thread(_sync_range_core, db, start_dt, now + timedelta(days=1), PEOPLE_BACKFILL_MAX_PAGES, 1)
-            db.close()
-            logger.info("[news] people backfill on start done (days=%s)", PEOPLE_BACKFILL_DAYS)
-        except Exception:
-            logger.exception("[news] people backfill on start failed")
-
-    while True:
-        try:
-            await asyncio.sleep(max(5, PEOPLE_SYNC_INTERVAL_MIN * 60))
-            db = SessionLocal()
-            res = await asyncio.to_thread(_auto_sync_once, db, PEOPLE_SYNC_BACKSTOP_DAYS, 12, 1)
-            db.close()
-            logger.info("[news] people auto-sync: %s", res)
-        except asyncio.CancelledError:
-            logger.info("[news] people auto-sync loop cancelled")
-            return
-        except Exception:
-            logger.exception("[news] people auto-sync loop error, continuing...")
-
-async def start_people_refresh_background() -> None:
-    if not PEOPLE_SYNC_ENABLED:
-        logger.info("[news] people auto-sync disabled by env")
-        return
-    if SessionLocal is None:
-        logger.warning("[news] cannot start people auto-sync: SessionLocal missing")
-        return
-    global _people_task
-    if _people_task and not _people_task.done():
-        return
-    _people_task = asyncio.create_task(_people_refresh_loop())
-    logger.info("[news] people auto-sync started (every %d min)", PEOPLE_SYNC_INTERVAL_MIN)
-
-async def stop_people_refresh_background() -> None:
-    global _people_task
-    if _people_task:
-        _people_task.cancel()
-        try:
-            await _people_task
-        except asyncio.CancelledError:
-            pass
-        _people_task = None
-
-
-def _apply_default_range_if_missing(
-    start_dt: Optional[datetime],
-    end_dt: Optional[datetime],
-    days: int = 30
-) -> tuple[Optional[datetime], Optional[datetime]]:
-    """
-    If both start_dt and end_dt are None, set a default window of the last `days` days.
-    end_dt is set to tomorrow (exclusive upper bound).
-    """
-    if start_dt is None and end_dt is None:
-        today_utc = datetime.utcnow()
-        start_dt = today_utc - timedelta(days=days)
-        end_dt = today_utc + timedelta(days=1)
-    return start_dt, end_dt
-
-
-# ---------- Funding publish-date helper (robust) ----------
-def _funding_pub_dt(it: dict) -> Optional[datetime]:
-    """
-    Try hard to find/parse a publish datetime on a funding feed item.
-    Accepts datetime/date objects or strings in common keys.
-    Returns a date-only datetime (00:00) for consistent comparisons.
-    """
-    for key in ("published_at", "published", "updated", "pubDate", "date", "iso_date", "created"):
-        v = it.get(key)
-        if isinstance(v, datetime):
-            return datetime(v.year, v.month, v.day)
-        if isinstance(v, date):
-            return datetime(v.year, v.month, v.day)
-        if isinstance(v, str):
-            try:
-                d = dateparse.parse(v)
-                return datetime(d.year, d.month, d.day)
-            except Exception:
-                continue
-    return None
-
-
-# ================== ROUTES ==================
-@router.get("", response_model=dict)
-def list_news(
-    from_date: Optional[str] = Query(None, alias="from"),
-    to_date: Optional[str] = Query(None, alias="to"),
-    q: Optional[str] = Query(None),
-    db: Session = Depends(get_db),
-):
-    begin_funding_parse_request()
-
-    start_dt = _parse_date_only(from_date)
-    end_dt = _parse_date_only(to_date)
-    if end_dt:
-        end_dt = end_dt + timedelta(days=1)
-    # ✅ enforce 30-day default when no filter is passed
-    start_dt, end_dt = _apply_default_range_if_missing(start_dt, end_dt, days=30)
-
-    ov_map: Dict[str, object] = {o.url: o for o in list_overrides_all(db, limit=10000)}
-    rows = _people_rows_in_window(db, start_dt, end_dt, limit=20000)
-
-    items: List[NewsItem] = []
-
-    # ---- People Spotting ----
-    for r in rows:
-        if not is_positive_movement(r.title or ""):
-            continue
-        pub = _as_datetime(getattr(r, "published_at", None))
-        cap = _as_datetime(_row_created_like(r))
-        basis = pub or cap
-        if basis is None:
-            continue
-        if q:
-            ql = q.lower()
-            if ql not in (r.title or "").lower() and ql not in (r.url or "").lower():
-                continue
-        month_label = basis.strftime("%b %Y") if basis else None
-        parsed = _parse_people_title(r.title or "")
-        item = NewsItem(
-            person_name=parsed.get("name"),
-            role=parsed.get("designation"),
-            company=parsed.get("company"),
-            email=None,
-            url=r.url,
-            published_at=pub,
-            created_at=cap,
-            city=None,
-            month_label=month_label,
-            category="People Spotting",
-            source=r.source,
-        )
-        ov = ov_map.get(r.url or "")
-        items.append(_apply_newsitem_override(item, ov))
-
-    # ---- Funding ----
-    funding = None
-    if USE_FUNDING_CACHE and isinstance(FUNDING_CACHE.get("raw"), list):
-        funding = FUNDING_CACHE["raw"]
-    else:
-        if _fetch_funding_items_range and (start_dt or end_dt):
-            funding = _fetch_funding_items_range(start_dt, end_dt)
-        else:
-            funding = fetch_funding_items()
-
-    for it in funding or []:
-        pub_dt = _funding_pub_dt(it)
-
-        # If we have a date, enforce the window. If not, keep the item (don’t drop it).
-        if pub_dt:
-            if start_dt and pub_dt < start_dt:
-                continue
-            if end_dt and pub_dt >= end_dt:
-                continue
-
-        if q:
-            ql = q.lower()
-            if ql not in (it.get("title") or "").lower() and ql not in (it.get("url") or "").lower():
-                continue
-
-        parsed = parse_funding_text(it.get("title") or "", (it.get("summary") or it.get("description") or ""))
-
-        # Skip digests/roundups unless parser found meaningful fields
-        if not (parsed.company or parsed.amount or parsed.round or parsed.investors):
-            continue
-
-        item = NewsItem(
-            person_name=None,
-            role=None,
-            company=parsed.company or _clean(it.get("company")),
-            email=None,
-            url=it.get("url"),
-            published_at=pub_dt,  # may be None
-            created_at=None,
-            city=None,
-            month_label=(pub_dt.strftime("%b %Y") if pub_dt else None),
-            category="Funding",
-            source=it.get("source") or "yourstory",
-        )
-        ov = ov_map.get(it.get("url") or "")
-        items.append(_apply_newsitem_override(item, ov))
-
-    # Newest → oldest using datetime key
-    items.sort(key=lambda x: (x.published_at is None, x.published_at or datetime.min), reverse=True)
-    stats = get_funding_parse_stats(reset=True)
-    window = {"from": (start_dt.date().isoformat() if start_dt else None),
-              "to": ((end_dt - timedelta(days=1)).date().isoformat() if end_dt else None)}
-    return {"items": [i.dict() for i in items], "fallback_used": USE_LLM, "funding_parse_stats": stats, "window": window}
-
-
-@router.get("/auto_sync_status", response_model=dict)
-def auto_sync_status(db: Session = Depends(get_db)):
-    latest = _latest_basis_datetime(db)
-    total = db.query(Movement).count()
-    return {"latest": latest.isoformat() if latest else None,
-            "days_since": ((datetime.utcnow() - latest).days if latest else None),
-            "total": total}
+    return {
+        "latest_before": (latest.isoformat() if latest else None),
+        "cutoff_used": cutoff.isoformat(),
+        "fetched": fetched,
+        "considered": considered,
+        "added": added,
+        "total": total,
+    }
 
 
 @router.post("/auto_sync_now", response_model=dict)
@@ -1011,9 +688,24 @@ def sync_range(
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid from/to date")
 
-    stats = _sync_range_core(db, start_dt, end_dt, max_pages=max_pages, start_page=start_page)
-    stats.update({"from": from_date, "to": to_date, "scanned_pages": max_pages})
-    return stats
+    scraped = scrape_paginated(start_page=start_page, max_pages=max_pages, stop_before=start_dt)
+    fetched = len(scraped)
+
+    added = 0
+    kept = 0
+    for it in scraped:
+        dt = _as_datetime(it.get("published_at"))
+        if dt and not (start_dt <= dt < end_dt):
+            continue
+        kept += 1
+        if get_by_url(db, it["url"]):
+            continue
+        create(db, title=it["title"], url=it["url"], source="afaqs", published_at=dt)
+        added += 1
+
+    total = db.query(Movement).count()
+    return {"fetched": fetched, "added": added, "considered": kept, "total": total,
+            "from": from_date, "to": to_date, "scanned_pages": max_pages}
 
 
 @router.get("/outreach", response_model=dict)
@@ -1046,21 +738,22 @@ def get_news_table(
     q: Optional[str] = Query(None),
     db: Session = Depends(get_db),
 ):
+    """
+    Flat table for the UI. Default: last 30 days if no range is passed.
+    """
     begin_funding_parse_request()
 
     start_dt = _parse_date_only(from_date)
     end_dt = _parse_date_only(to_date)
     if end_dt:
         end_dt = end_dt + timedelta(days=1)
-    # ✅ enforce 30-day default server-side
     start_dt, end_dt = _apply_default_range_if_missing(start_dt, end_dt, days=30)
 
     ov_map: Dict[str, object] = {o.url: o for o in list_overrides_all(db, limit=10000)}
-
     table_with_keys: List[Tuple[Optional[datetime], NewsFlatItem]] = []
 
-    # ---- People Spotting ----
-    rows = _people_rows_in_window(db, start_dt, end_dt, limit=20000)
+    # ---- People (load recent, filter in Python) ----
+    rows = list_recent(db, limit=20000)
     for r in rows:
         if not is_positive_movement(r.title or ""):
             continue
@@ -1069,6 +762,11 @@ def get_news_table(
         cap = _as_datetime(_row_created_like(r))
         basis = pub or cap
         if basis is None:
+            continue
+
+        if start_dt and basis < start_dt:
+            continue
+        if end_dt and basis >= end_dt:
             continue
 
         if q:
@@ -1097,7 +795,6 @@ def get_news_table(
         table_with_keys.append((basis, row))
 
     # ---- Funding ----
-    funding = None
     if USE_FUNDING_CACHE and isinstance(FUNDING_CACHE.get("raw"), list):
         funding = FUNDING_CACHE["raw"]
     else:
@@ -1109,7 +806,7 @@ def get_news_table(
     for it in funding or []:
         pub_dt = _funding_pub_dt(it)
 
-        # If we have a date, enforce the window. If not, keep the item.
+        # Apply window only if we have a date
         if pub_dt:
             if start_dt and pub_dt < start_dt:
                 continue
@@ -1125,10 +822,6 @@ def get_news_table(
             it.get("title") or "",
             (it.get("summary") or it.get("description") or "")
         )
-
-        # Skip digests/roundups unless parser found something meaningful
-        if not (parsed.company or parsed.amount or parsed.round or parsed.investors):
-            continue
 
         row = NewsFlatItem(
             company=parsed.company or _clean(it.get("company")),
@@ -1152,7 +845,6 @@ def get_news_table(
         row = _apply_flat_override(row, ov)
         table_with_keys.append((pub_dt, row))
 
-    # Newest → oldest using proper datetime key
     table_with_keys.sort(key=lambda t: (t[0] is None, t[0] or datetime.min), reverse=True)
     out = [row for _, row in table_with_keys]
 
@@ -1162,13 +854,125 @@ def get_news_table(
     return {"items": [i.dict() for i in out], "funding_parse_stats": stats, "window": window}
 
 
-@router.post("/purge_negatives", response_model=dict)
-def purge_negatives(db: Session = Depends(get_db)):
-    rows = db.query(Movement).all()
-    removed = 0
-    for r in rows:
-        if not is_positive_movement(r.title or ""):
-            db.delete(r)
-            removed += 1
-    db.commit()
-    return {"removed": removed}
+# ---- background loops (people + funding) ----
+async def _rebuild_funding_cache() -> None:
+    if not USE_FUNDING_CACHE:
+        return
+    try:
+        start_dt = datetime.utcnow() - timedelta(days=30)
+        end_dt   = datetime.utcnow() + timedelta(days=1)
+        if _fetch_funding_items_range:
+            raw = _fetch_funding_items_range(start_dt, end_dt)
+        else:
+            raw = fetch_funding_items()
+        FUNDING_CACHE["raw"] = raw or []
+        FUNDING_CACHE["built_at"] = datetime.utcnow()
+        logger.info("[news] funding_cache: rebuilt items=%s", len(FUNDING_CACHE["raw"]))
+    except Exception:
+        logger.exception("[news] funding_cache: rebuild failed")
+
+async def _funding_refresh_loop() -> None:
+    if FUNDING_CACHE_WARM_ON_START:
+        await _rebuild_funding_cache()
+    while True:
+        try:
+            await asyncio.sleep(_seconds_until_next_monday(FUNDING_CACHE_UTC_HOUR, FUNDING_CACHE_UTC_MIN))
+            await _rebuild_funding_cache()
+        except asyncio.CancelledError:
+            logger.info("[news] funding_cache: background loop cancelled")
+            return
+        except Exception:
+            logger.exception("[news] funding_cache: loop error, continuing...")
+
+def _seconds_until_next_monday(hour: int, minute: int) -> float:
+    now = datetime.utcnow()
+    days_ahead = (0 - now.weekday()) % 7
+    target = datetime(now.year, now.month, now.day, hour, minute)
+    if days_ahead == 0 and target <= now:
+        days_ahead = 7
+    if days_ahead > 0:
+        target = target + timedelta(days=days_ahead)
+    return max(1.0, (target - now).total_seconds())
+
+async def start_funding_refresh_background(launch_now: bool = False) -> None:
+    if not USE_FUNDING_CACHE:
+        logger.info("[news] funding_cache: disabled by env")
+        return
+    global _funding_task
+    if _funding_task and not _funding_task.done():
+        return
+    _funding_task = asyncio.create_task(_funding_refresh_loop())
+    logger.info("[news] funding_cache: loop started (Mon %02d:%02d UTC) warm_on_start=%s",
+                FUNDING_CACHE_UTC_HOUR, FUNDING_CACHE_UTC_MIN, FUNDING_CACHE_WARM_ON_START)
+    if launch_now and not FUNDING_CACHE_WARM_ON_START:
+        await _rebuild_funding_cache()
+
+async def stop_funding_refresh_background() -> None:
+    global _funding_task
+    if _funding_task:
+        _funding_task.cancel()
+        try:
+            await _funding_task
+        except asyncio.CancelledError:
+            pass
+        _funding_task = None
+
+
+async def _people_refresh_loop() -> None:
+    assert SessionLocal is not None, "SessionLocal not available to run people sync loop."
+    if PEOPLE_BACKFILL_ON_START:
+        try:
+            db = SessionLocal()
+            now = datetime.utcnow()
+            start_dt = now - timedelta(days=PEOPLE_BACKFILL_DAYS)
+            # Backfill window
+            scraped = scrape_paginated(start_page=1, max_pages=PEOPLE_BACKFILL_MAX_PAGES, stop_before=start_dt)
+            added = 0
+            for it in scraped:
+                dt = _as_datetime(it.get("published_at"))
+                if dt and not (start_dt <= dt < now + timedelta(days=1)):
+                    continue
+                if not get_by_url(db, it["url"]):
+                    create(db, title=it["title"], url=it["url"], source="afaqs", published_at=dt)
+                    added += 1
+            db.commit()
+            db.close()
+            logger.info("[news] people backfill on start done (added=%s)", added)
+        except Exception:
+            logger.exception("[news] people backfill on start failed")
+
+    while True:
+        try:
+            await asyncio.sleep(max(5, PEOPLE_SYNC_INTERVAL_MIN * 60))
+            db = SessionLocal()
+            res = _auto_sync_once(db, PEOPLE_SYNC_BACKSTOP_DAYS, 12, 1)
+            db.close()
+            logger.info("[news] people auto-sync: %s", res)
+        except asyncio.CancelledError:
+            logger.info("[news] people auto-sync loop cancelled")
+            return
+        except Exception:
+            logger.exception("[news] people auto-sync loop error, continuing...")
+
+async def start_people_refresh_background() -> None:
+    if not PEOPLE_SYNC_ENABLED:
+        logger.info("[news] people auto-sync disabled by env")
+        return
+    if SessionLocal is None:
+        logger.warning("[news] cannot start people auto-sync: SessionLocal missing")
+        return
+    global _people_task
+    if _people_task and not _people_task.done():
+        return
+    _people_task = asyncio.create_task(_people_refresh_loop())
+    logger.info("[news] people auto-sync started (every %d min)", PEOPLE_SYNC_INTERVAL_MIN)
+
+async def stop_people_refresh_background() -> None:
+    global _people_task
+    if _people_task:
+        _people_task.cancel()
+        try:
+            await _people_task
+        except asyncio.CancelledError:
+            pass
+        _people_task = None

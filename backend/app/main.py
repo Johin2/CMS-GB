@@ -16,10 +16,6 @@ from app.scheduler import init_scheduler
 
 
 def _parse_origins(env_value: str) -> list[str]:
-    """
-    Accepts comma/space/newline separated values. Strips trailing slashes.
-    Example: "https://cms-gb.vercel.app, http://localhost:3000"
-    """
     if not env_value:
         return []
     raw = [p.strip() for p in env_value.replace("\n", ",").split(",")]
@@ -27,7 +23,7 @@ def _parse_origins(env_value: str) -> list[str]:
     for v in raw:
         if not v:
             continue
-        v = v.rstrip("/")  # Origin header never has trailing slash
+        v = v.rstrip("/")
         if v not in cleaned:
             cleaned.append(v)
     return cleaned
@@ -35,33 +31,27 @@ def _parse_origins(env_value: str) -> list[str]:
 
 app = FastAPI(title="People Movements API", version="1.3")
 
-# Read from env; fall back to common dev/prod URLs (no trailing slashes)
 env_origins = os.getenv("CORS_ORIGIN", "")
-allowed_origins = _parse_origins(env_origins)
-if not allowed_origins:
-    allowed_origins = [
-        "https://cms-gb.vercel.app",
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-    ]
+allowed_origins = _parse_origins(env_origins) or [
+    "https://cms-gb.vercel.app",
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+]
 
-# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
-    allow_credentials=False,  # set True only if you share cookies across origins
+    allow_credentials=False,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"],
     allow_headers=["*"],
 )
 
-# Routers
 app.include_router(health_router, tags=["health"])
 app.include_router(news_router, prefix="/api", tags=["news"])
 app.include_router(debug_router, prefix="/api/debug", tags=["debug"])
 app.include_router(overrides_router, prefix="/api", tags=["overrides"])
 app.include_router(contacts_router, prefix="/api", tags=["contacts"])
 
-# Scheduler / startup
 init_scheduler(app)
 
 @app.on_event("startup")
@@ -73,7 +63,5 @@ def _startup_db() -> None:
 
 @app.on_event("startup")
 async def _start_background_jobs() -> None:
-    # Weekly funding cache (warm on boot if enabled)
     await start_funding_refresh_background()
-    # Hourly people sync (interval & backfill controlled by env)
     await start_people_refresh_background()
