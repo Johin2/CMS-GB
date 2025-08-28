@@ -189,7 +189,7 @@ export default function NewsPage() {
       if (from) params.set('from', from);
       if (to) params.set('to', to);
       const query = params.toString();
-      const data = await apiFetch('/news/table${query ? `?${query}` : ''}`);
+      const data = await apiFetch(`/news/table${query ? `?${query}` : ''}`);
       setItems(Array.isArray(data?.items) ? data.items : []);
     } catch (e) {
       console.error(e);
