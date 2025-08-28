@@ -9,10 +9,17 @@ import { Calendar, Search, ChevronDown, ChevronRight, Check, Pencil, X, Save, Ro
 ---------------------------- */
 const API_BASE = (() => {
   const env = process.env.NEXT_PUBLIC_API_BASE;
-  if (env && /^https?:\/\//i.test(env)) return env.replace(/\/+$/, '');
+  // If provided and looks like an absolute URL, normalize and ensure it ends with /api
+  if (env && /^https?:\/\//i.test(env)) {
+    const trimmed = env.replace(/\/+$/, '');
+    return trimmed.endsWith('/api') ? trimmed : `${trimmed}/api`;
+  }
+  // Fall back to same-origin proxy (/api) in Next.js
   if (typeof window !== 'undefined') return `${window.location.origin}/api`;
+  // Dev fallback
   return 'http://127.0.0.1:8000/api';
 })();
+
 const joinUrl = (base, path) =>
   `${base.replace(/\/+$/, '')}/${String(path || '').replace(/^\/+/, '')}`;
 
