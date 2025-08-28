@@ -19,13 +19,16 @@ from app.scheduler import init_scheduler
 # -------------------------------------------------------
 app = FastAPI(title="People Movements API", version="1.3")
 
+VERCEL_PROD = "https://cms-gb.vercel.app/"  # ← put the real one
+LOCAL_DEV  = "http://localhost:3000"   
+
+ALLOWED_ORIGINS = [VERCEL_PROD, LOCAL_DEV]
+
+
 # CORS — set your real frontend domains here
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://<your-vercel-domain>.vercel.app",
-        "https://<your-custom-domain>"
-    ],
+    allow_origins = ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
