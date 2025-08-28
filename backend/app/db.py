@@ -4,11 +4,14 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy import text
 from urllib.parse import urlparse, unquote
 from pathlib import Path
+import os
 from .core.config import settings
 
 def _ensure_sqlite_parent_dir(url: str) -> str:
     parsed = urlparse(url)
-    db_path = unquote(parsed.path)
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+    DB_PATH = os.path.join(BASE_DIR, "app.db")  # lives in backend/app.db
+
 
     # On Windows an absolute path may look like "/C:/Users/..."; strip leading slash.
     if db_path.startswith("/") and len(db_path) > 2 and db_path[2] == ":":

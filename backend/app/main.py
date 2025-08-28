@@ -27,7 +27,10 @@ app = FastAPI(title="People Movements API", version="1.3")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=(settings.CORS_ORIGINS if isinstance(settings.CORS_ORIGINS, list) else str(settings.CORS_ORIGINS).split(",")),
+    allow_origins=[
+        "https://<your-vercel-domain>.vercel.app",
+        "https://<your-custom-domain>"
+    ],
     allow_methods=["*"],
     allow_headers=["*"],
     allow_credentials=True,
