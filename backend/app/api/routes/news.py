@@ -65,12 +65,14 @@ router = APIRouter(prefix="/news")
 USE_FUNDING_CACHE = str(os.getenv("FUNDING_CACHE_ENABLED", "1")).lower() in {"1", "true", "yes", "on"}
 FUNDING_CACHE_WARM_ON_START = str(os.getenv("FUNDING_CACHE_WARM_ON_START", "1")).lower() in {"1", "true", "yes", "on"}
 FUNDING_CACHE_UTC_HOUR = int(os.getenv("FUNDING_CACHE_UTC_HOUR", "6"))
-FUNDING_CACHE_UTC_MIN  = int(os.getenv("FUNDING_CACHE_UTC_MINUTE", "0"))
+FUNDING_CACHE_UTC_MIN = int(os.getenv("FUNDING_CACHE_UTC_MINUTE", "0"))
 FUNDING_CACHE_MAX_AGE_MIN = int(os.getenv("FUNDING_CACHE_MAX_AGE_MIN", "180"))  # 3h default
+FUNDING_CACHE_SPAN_DAYS = int(os.getenv("FUNDING_CACHE_SPAN_DAYS", "31"))      # coverage window for cache
 FUNDING_MIN_EXPECTED = int(os.getenv("FUNDING_MIN_EXPECTED", "5"))
 FUNDING_MAX_PAGES = int(os.getenv("FUNDING_MAX_PAGES", "300"))
 
-FUNDING_CACHE: dict = {"raw": None, "built_at": None}
+# keep coverage window in cache metadata so we can decide whether to use it
+FUNDING_CACHE: dict = {"raw": None, "built_at": None, "from": None, "to": None}
 _funding_task: Optional[asyncio.Task] = None
 
 # ===== People hourly sync =====
@@ -167,7 +169,7 @@ def _strip_descriptor_prefix(s: str) -> str:
     if not s:
         return s
     words = s.split()
-    lows  = [w.lower() for w in words]
+    lows = [w.lower() for w in words]
     anchors = (
         "executive","veteran","alum","alumnus","alumna",
         "leader","head","manager","director","officer",
@@ -323,7 +325,7 @@ def _parse_people_title_rules(title: str) -> dict:
                         out.update({"company": company_rhs, "name": name, "designation": designation})
                         return out
                     else:
-                        designation, company_rhs = _split_trailing_company(rhs)  # noqa: F821 (defined by closure below)
+                        designation, company_rhs = _split_trailing_company(rhs)  # noqa: F821
                         out.update({"company": company_rhs if company_rhs else company, "name": name, "designation": designation})
                         return out
             if name is None:
@@ -462,14 +464,28 @@ def _fresh_enough_cache() -> bool:
     age_min = (datetime.utcnow() - built).total_seconds() / 60.0
     return age_min <= FUNDING_CACHE_MAX_AGE_MIN
 
+def _cache_covers(start_dt: Optional[datetime], end_dt: Optional[datetime]) -> bool:
+    """Return True if the requested window is fully inside the cached one."""
+    if not _fresh_enough_cache():
+        return False
+    c_from = FUNDING_CACHE.get("from")
+    c_to = FUNDING_CACHE.get("to")
+    if not isinstance(c_from, datetime) or not isinstance(c_to, datetime):
+        return False
+    if start_dt and start_dt < c_from:
+        return False
+    if end_dt and end_dt > c_to:
+        return False
+    return True
+
 def _get_funding_items(start_dt: Optional[datetime], end_dt: Optional[datetime]) -> List[dict]:
     """
-    Use cache if it's fresh and large enough; otherwise do a live fetch.
+    Use cache only if it is fresh AND fully covers the requested window.
+    Otherwise, do a live fetch (range-aware when available).
     If the result looks too small, try a live fetch anyway.
     """
-    items: List[dict] = []
-    if _fresh_enough_cache() and isinstance(FUNDING_CACHE.get("raw"), list):
-        items = FUNDING_CACHE["raw"]  # already deduped at build time
+    if USE_FUNDING_CACHE and isinstance(FUNDING_CACHE.get("raw"), list) and _cache_covers(start_dt, end_dt):
+        items: List[dict] = FUNDING_CACHE["raw"]  # already deduped at build time
     else:
         items = _live_fetch_funding(start_dt, end_dt)
 
@@ -902,12 +918,19 @@ async def _rebuild_funding_cache() -> None:
     if not USE_FUNDING_CACHE:
         return
     try:
-        start_dt = datetime.utcnow() - timedelta(days=30)
-        end_dt   = datetime.utcnow() + timedelta(days=1)
+        start_dt = datetime.utcnow() - timedelta(days=FUNDING_CACHE_SPAN_DAYS)
+        end_dt = datetime.utcnow() + timedelta(days=1)
         raw = _live_fetch_funding(start_dt, end_dt)
         FUNDING_CACHE["raw"] = _dedupe_by_url(raw or [])
         FUNDING_CACHE["built_at"] = datetime.utcnow()
-        logger.info("[news] funding_cache: rebuilt items=%s", len(FUNDING_CACHE["raw"]))
+        FUNDING_CACHE["from"] = start_dt
+        FUNDING_CACHE["to"] = end_dt
+        logger.info(
+            "[news] funding_cache: rebuilt items=%s window=%s..%s",
+            len(FUNDING_CACHE["raw"]),
+            start_dt.date(),
+            (end_dt - timedelta(days=1)).date(),
+        )
     except Exception:
         logger.exception("[news] funding_cache: rebuild failed")
 
@@ -932,8 +955,12 @@ async def start_funding_refresh_background(launch_now: bool = False) -> None:
     if _funding_task and not _funding_task.done():
         return
     _funding_task = asyncio.create_task(_funding_refresh_loop())
-    logger.info("[news] funding_cache: loop started (Mon %02d:%02d UTC) warm_on_start=%s",
-                FUNDING_CACHE_UTC_HOUR, FUNDING_CACHE_UTC_MIN, FUNDING_CACHE_WARM_ON_START)
+    logger.info(
+        "[news] funding_cache: loop started (Mon %02d:%02d UTC) warm_on_start=%s",
+        FUNDING_CACHE_UTC_HOUR,
+        FUNDING_CACHE_UTC_MIN,
+        FUNDING_CACHE_WARM_ON_START,
+    )
     if launch_now and not FUNDING_CACHE_WARM_ON_START:
         await _rebuild_funding_cache()
 
