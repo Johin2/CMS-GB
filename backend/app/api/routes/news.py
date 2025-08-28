@@ -9,7 +9,6 @@ import logging
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from dateutil import parser as dateparse
-from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.db.session import get_db
@@ -138,6 +137,17 @@ def _row_created_like(r) -> Optional[datetime]:
         or getattr(r, "created_at", None)
         or getattr(r, "created", None)
     )
+
+
+def _parse_date_only(s: Optional[str]) -> Optional[datetime]:
+    """Parse 'YYYY-MM-DD' (or similar) and return a midnight-UTC datetime; None if empty/invalid."""
+    if not s:
+        return None
+    try:
+        d = dateparse.parse(str(s))
+        return datetime(d.year, d.month, d.day)
+    except Exception:
+        return None
 
 
 # ---------- (robust) funding publish date ----------
@@ -855,6 +865,16 @@ def get_news_table(
 
 
 # ---- background loops (people + funding) ----
+def _seconds_until_next_monday(hour: int, minute: int) -> float:
+    now = datetime.utcnow()
+    days_ahead = (0 - now.weekday()) % 7
+    target = datetime(now.year, now.month, now.day, hour, minute)
+    if days_ahead == 0 and target <= now:
+        days_ahead = 7
+    if days_ahead > 0:
+        target = target + timedelta(days=days_ahead)
+    return max(1.0, (target - now).total_seconds())
+
 async def _rebuild_funding_cache() -> None:
     if not USE_FUNDING_CACHE:
         return
@@ -883,16 +903,6 @@ async def _funding_refresh_loop() -> None:
             return
         except Exception:
             logger.exception("[news] funding_cache: loop error, continuing...")
-
-def _seconds_until_next_monday(hour: int, minute: int) -> float:
-    now = datetime.utcnow()
-    days_ahead = (0 - now.weekday()) % 7
-    target = datetime(now.year, now.month, now.day, hour, minute)
-    if days_ahead == 0 and target <= now:
-        days_ahead = 7
-    if days_ahead > 0:
-        target = target + timedelta(days=days_ahead)
-    return max(1.0, (target - now).total_seconds())
 
 async def start_funding_refresh_background(launch_now: bool = False) -> None:
     if not USE_FUNDING_CACHE:
@@ -925,7 +935,6 @@ async def _people_refresh_loop() -> None:
             db = SessionLocal()
             now = datetime.utcnow()
             start_dt = now - timedelta(days=PEOPLE_BACKFILL_DAYS)
-            # Backfill window
             scraped = scrape_paginated(start_page=1, max_pages=PEOPLE_BACKFILL_MAX_PAGES, stop_before=start_dt)
             added = 0
             for it in scraped:
