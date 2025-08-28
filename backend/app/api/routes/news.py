@@ -1,4 +1,3 @@
-# backend/app/api/routes/news.py
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta
@@ -37,6 +36,8 @@ from app.services.scraper.funding_parse import (
 )
 
 try:
+    # expected signature:
+    # fetch_funding_items_range(start_dt: Optional[datetime], end_dt: Optional[datetime], max_pages: int = 200) -> List[dict]
     from app.services.scraper.funding_rss import fetch_funding_items_range as _fetch_funding_items_range  # type: ignore
 except Exception:
     _fetch_funding_items_range: Optional[Callable[..., List[dict]]] = None
@@ -82,6 +83,7 @@ _people_task: Optional[asyncio.Task] = None
 
 def _seconds_until_next_monday(hour: int, minute: int) -> float:
     now = datetime.utcnow()
+    # Monday is 0
     days_ahead = (0 - now.weekday()) % 7
     target = datetime(now.year, now.month, now.day, hour, minute)
     if days_ahead == 0 and target <= now:
@@ -92,6 +94,9 @@ def _seconds_until_next_monday(hour: int, minute: int) -> float:
 
 
 async def _rebuild_funding_cache() -> None:
+    """
+    Rebuilds the raw funding cache for the last 30 days (UTC).
+    """
     if not USE_FUNDING_CACHE:
         return
     try:
@@ -130,8 +135,10 @@ async def start_funding_refresh_background(launch_now: bool = False) -> None:
     if _funding_task and not _funding_task.done():
         return
     _funding_task = asyncio.create_task(_funding_refresh_loop())
-    logger.info("[news] funding_cache: loop started (Mon %02d:%02d UTC) warm_on_start=%s",
-                FUNDING_CACHE_UTC_HOUR, FUNDING_CACHE_UTC_MIN, FUNDING_CACHE_WARM_ON_START)
+    logger.info(
+        "[news] funding_cache: loop started (Mon %02d:%02d UTC) warm_on_start=%s",
+        FUNDING_CACHE_UTC_HOUR, FUNDING_CACHE_UTC_MIN, FUNDING_CACHE_WARM_ON_START
+    )
     if launch_now and not FUNDING_CACHE_WARM_ON_START:
         await _rebuild_funding_cache()
 
@@ -207,7 +214,7 @@ def _row_created_like(r) -> Optional[datetime]:
         or getattr(r, "created", None)
     )
 
-# ===== FULL rules-only people-title parser (restored) =====
+# ===== FULL rules-only people-title parser =====
 def _strip_descriptor_prefix(s: str) -> str:
     s = _clean(s)
     if not s:
@@ -640,6 +647,9 @@ def _apply_newsitem_override(item: "NewsItem", ov) -> "NewsItem":
 
 
 def _people_rows_in_window(db: Session, start_dt: Optional[datetime], end_dt: Optional[datetime], limit: int = 20000):
+    """
+    Fetch people rows whose published_at OR captured/created timestamps fall inside [start_dt, end_dt).
+    """
     q = db.query(Movement)
     conds = []
 
@@ -781,6 +791,10 @@ def _apply_default_range_if_missing(
     end_dt: Optional[datetime],
     days: int = 30
 ) -> tuple[Optional[datetime], Optional[datetime]]:
+    """
+    If both start_dt and end_dt are None, set a default window of the last `days` days.
+    end_dt is set to tomorrow (exclusive upper bound).
+    """
     if start_dt is None and end_dt is None:
         today_utc = datetime.utcnow()
         start_dt = today_utc - timedelta(days=days)
@@ -788,6 +802,29 @@ def _apply_default_range_if_missing(
     return start_dt, end_dt
 
 
+# ---------- Funding publish-date helper (robust) ----------
+def _funding_pub_dt(it: dict) -> Optional[datetime]:
+    """
+    Try hard to find/parse a publish datetime on a funding feed item.
+    Accepts datetime/date objects or strings in common keys.
+    Returns a date-only datetime (00:00) for consistent comparisons.
+    """
+    for key in ("published_at", "published", "updated", "pubDate", "date", "iso_date", "created"):
+        v = it.get(key)
+        if isinstance(v, datetime):
+            return datetime(v.year, v.month, v.day)
+        if isinstance(v, date):
+            return datetime(v.year, v.month, v.day)
+        if isinstance(v, str):
+            try:
+                d = dateparse.parse(v)
+                return datetime(d.year, d.month, d.day)
+            except Exception:
+                continue
+    return None
+
+
+# ================== ROUTES ==================
 @router.get("", response_model=dict)
 def list_news(
     from_date: Optional[str] = Query(None, alias="from"),
@@ -801,6 +838,7 @@ def list_news(
     end_dt = _parse_date_only(to_date)
     if end_dt:
         end_dt = end_dt + timedelta(days=1)
+    # ✅ enforce 30-day default when no filter is passed
     start_dt, end_dt = _apply_default_range_if_missing(start_dt, end_dt, days=30)
 
     ov_map: Dict[str, object] = {o.url: o for o in list_overrides_all(db, limit=10000)}
@@ -808,6 +846,7 @@ def list_news(
 
     items: List[NewsItem] = []
 
+    # ---- People Spotting ----
     for r in rows:
         if not is_positive_movement(r.title or ""):
             continue
@@ -838,6 +877,7 @@ def list_news(
         ov = ov_map.get(r.url or "")
         items.append(_apply_newsitem_override(item, ov))
 
+    # ---- Funding ----
     funding = None
     if USE_FUNDING_CACHE and isinstance(FUNDING_CACHE.get("raw"), list):
         funding = FUNDING_CACHE["raw"]
@@ -848,16 +888,13 @@ def list_news(
             funding = fetch_funding_items()
 
     for it in funding or []:
-        pub_d = _as_date(it.get("published_at"))
-        pub_dt = _as_datetime(pub_d) if pub_d else None
+        pub_dt = _funding_pub_dt(it)
 
+        # If we have a date, enforce the window. If not, keep the item (don’t drop it).
         if pub_dt:
             if start_dt and pub_dt < start_dt:
                 continue
             if end_dt and pub_dt >= end_dt:
-                continue
-        else:
-            if start_dt or end_dt:
                 continue
 
         if q:
@@ -867,6 +904,7 @@ def list_news(
 
         parsed = parse_funding_text(it.get("title") or "", (it.get("summary") or it.get("description") or ""))
 
+        # Skip digests/roundups unless parser found meaningful fields
         if not (parsed.company or parsed.amount or parsed.round or parsed.investors):
             continue
 
@@ -876,7 +914,7 @@ def list_news(
             company=parsed.company or _clean(it.get("company")),
             email=None,
             url=it.get("url"),
-            published_at=pub_dt,
+            published_at=pub_dt,  # may be None
             created_at=None,
             city=None,
             month_label=(pub_dt.strftime("%b %Y") if pub_dt else None),
@@ -886,6 +924,7 @@ def list_news(
         ov = ov_map.get(it.get("url") or "")
         items.append(_apply_newsitem_override(item, ov))
 
+    # Newest → oldest using datetime key
     items.sort(key=lambda x: (x.published_at is None, x.published_at or datetime.min), reverse=True)
     stats = get_funding_parse_stats(reset=True)
     window = {"from": (start_dt.date().isoformat() if start_dt else None),
@@ -1013,12 +1052,14 @@ def get_news_table(
     end_dt = _parse_date_only(to_date)
     if end_dt:
         end_dt = end_dt + timedelta(days=1)
+    # ✅ enforce 30-day default server-side
     start_dt, end_dt = _apply_default_range_if_missing(start_dt, end_dt, days=30)
 
     ov_map: Dict[str, object] = {o.url: o for o in list_overrides_all(db, limit=10000)}
 
     table_with_keys: List[Tuple[Optional[datetime], NewsFlatItem]] = []
 
+    # ---- People Spotting ----
     rows = _people_rows_in_window(db, start_dt, end_dt, limit=20000)
     for r in rows:
         if not is_positive_movement(r.title or ""):
@@ -1055,6 +1096,7 @@ def get_news_table(
         row = _apply_flat_override(row, ov)
         table_with_keys.append((basis, row))
 
+    # ---- Funding ----
     funding = None
     if USE_FUNDING_CACHE and isinstance(FUNDING_CACHE.get("raw"), list):
         funding = FUNDING_CACHE["raw"]
@@ -1065,16 +1107,14 @@ def get_news_table(
             funding = fetch_funding_items()
 
     for it in funding or []:
-        pub_d = _as_date(it.get("published_at"))
-        pub_dt = _as_datetime(pub_d) if pub_d else None
+        pub_dt = _funding_pub_dt(it)
 
+        # If we have a date, enforce the window. If not, keep the item.
         if pub_dt:
             if start_dt and pub_dt < start_dt:
                 continue
             if end_dt and pub_dt >= end_dt:
                 continue
-        elif (start_dt or end_dt):
-            continue
 
         if q:
             ql = q.lower()
@@ -1086,6 +1126,7 @@ def get_news_table(
             (it.get("summary") or it.get("description") or "")
         )
 
+        # Skip digests/roundups unless parser found something meaningful
         if not (parsed.company or parsed.amount or parsed.round or parsed.investors):
             continue
 
@@ -1111,6 +1152,7 @@ def get_news_table(
         row = _apply_flat_override(row, ov)
         table_with_keys.append((pub_dt, row))
 
+    # Newest → oldest using proper datetime key
     table_with_keys.sort(key=lambda t: (t[0] is None, t[0] or datetime.min), reverse=True)
     out = [row for _, row in table_with_keys]
 

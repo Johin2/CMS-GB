@@ -5,11 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.routes.contacts import router as contacts_router
 from app.api.routes.health import router as health_router
-from app.api.routes.news import (
-    router as news_router,
-    start_funding_refresh_background,
-    start_people_refresh_background,
-)
+from app.api.routes.news import router as news_router, start_funding_refresh_background, start_people_refresh_background
 from app.api.routes.debug import router as debug_router
 from app.api.routes.overrides import router as overrides_router
 
@@ -37,7 +33,7 @@ def _parse_origins(env_value: str) -> list[str]:
     return cleaned
 
 
-app = FastAPI(title="People Movements API", version="1.4")
+app = FastAPI(title="People Movements API", version="1.3")
 
 # Read from env; fall back to common dev/prod URLs (no trailing slashes)
 env_origins = os.getenv("CORS_ORIGIN", "")
@@ -77,7 +73,7 @@ def _startup_db() -> None:
 
 @app.on_event("startup")
 async def _start_background_jobs() -> None:
-    # Warm funding cache now (in addition to weekly loop)
-    await start_funding_refresh_background(launch_now=True)
-    # Start hourly People sync loop (includes one-time backfill if enabled)
+    # Weekly funding cache (warm on boot if enabled)
+    await start_funding_refresh_background()
+    # Hourly people sync (interval & backfill controlled by env)
     await start_people_refresh_background()
