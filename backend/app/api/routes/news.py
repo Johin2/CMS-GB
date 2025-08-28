@@ -20,14 +20,13 @@ except Exception:
 from app.models.movement import Movement
 from app.schemas.news import NewsItem, NewsFlatItem
 from app.crud.movement import get_by_url, create, list_recent
-
-from app.crud.override import (
-    list_all as list_overrides_all,
-)
+from app.crud.override import list_all as list_overrides_all
 
 from app.services.scraper.afaqs import scrape_paginated, is_positive_movement
 
+# Funding (RSS) utilities
 from app.services.scraper.funding_rss import fetch_funding_items
+# LLM/rules funding parser + stats hooks
 from app.services.scraper.funding_parse import (
     parse_funding_text,
     get_funding_parse_stats,
@@ -41,10 +40,11 @@ try:
 except Exception:
     _fetch_funding_items_range: Optional[Callable[..., List[dict]]] = None
 
+# ---------- optional LLM fallback for people parsing ----------
 USE_LLM = str(os.getenv("NEWS_PARSE_WITH_LLM", "1")).lower() in {"1", "true", "yes", "on"}
 LLM_MODEL = os.getenv("NEWS_PARSE_MODEL", "gpt-4.1-mini")
 try:
-    from openai import OpenAI
+    from openai import OpenAI  # pip install openai>=1.30.0
     _openai_available = True
 except Exception:
     OpenAI = None
@@ -66,6 +66,9 @@ USE_FUNDING_CACHE = str(os.getenv("FUNDING_CACHE_ENABLED", "1")).lower() in {"1"
 FUNDING_CACHE_WARM_ON_START = str(os.getenv("FUNDING_CACHE_WARM_ON_START", "1")).lower() in {"1", "true", "yes", "on"}
 FUNDING_CACHE_UTC_HOUR = int(os.getenv("FUNDING_CACHE_UTC_HOUR", "6"))
 FUNDING_CACHE_UTC_MIN  = int(os.getenv("FUNDING_CACHE_UTC_MINUTE", "0"))
+FUNDING_CACHE_MAX_AGE_MIN = int(os.getenv("FUNDING_CACHE_MAX_AGE_MIN", "180"))  # 3h default
+FUNDING_MIN_EXPECTED = int(os.getenv("FUNDING_MIN_EXPECTED", "5"))
+FUNDING_MAX_PAGES = int(os.getenv("FUNDING_MAX_PAGES", "300"))
 
 FUNDING_CACHE: dict = {"raw": None, "built_at": None}
 _funding_task: Optional[asyncio.Task] = None
@@ -158,7 +161,7 @@ def _funding_pub_dt(it: dict) -> Optional[datetime]:
                 continue
     return None
 
-# ---------- people parser (rules + optional LLM fallback) ----------
+# ---------- PE0PLE PARSER (rules + optional LLM fallback) ----------
 def _strip_descriptor_prefix(s: str) -> str:
     s = _clean(s)
     if not s:
@@ -320,7 +323,7 @@ def _parse_people_title_rules(title: str) -> dict:
                         out.update({"company": company_rhs, "name": name, "designation": designation})
                         return out
                     else:
-                        designation, company_rhs = _split_trailing_company(rhs)
+                        designation, company_rhs = _split_trailing_company(rhs)  # noqa: F821 (defined by closure below)
                         out.update({"company": company_rhs if company_rhs else company, "name": name, "designation": designation})
                         return out
             if name is None:
@@ -328,30 +331,7 @@ def _parse_people_title_rules(title: str) -> dict:
             out.update({"company": company, "name": name, "designation": designation})
             return out
 
-    for verb in (" promoted to ", " elevated to ", " elevated as "):
-        if verb in low:
-            i = low.find(verb)
-            left = _clean(t[:i])
-            name = _strip_possessive(_clean(left))
-            rhs = t[i + len(verb):].strip()
-            rl = rhs.lower()
-            if " at " in rl:
-                k = rl.find(" at ")
-                out["designation"] = _clean(rhs[:k])
-                out["company"] = _clean(rhs[k + 4:])
-                out["name"] = name
-                return out
-            if " of " in rl:
-                k = rl.rfind(" of ")
-                out["designation"] = _clean(rhs[:k])
-                out["company"] = _clean(rhs[k + 4:])
-                out["name"] = name
-                return out
-            # fallback split
-            out["designation"] = _clean(rhs)
-            out["name"] = name
-            return out
-
+    # simple "at" fallback
     if " at " in low:
         i = low.find(" at ")
         out["name"] = _strip_possessive(_clean(t[:i]))
@@ -429,41 +409,6 @@ def _parse_people_title(title: str) -> dict:
     base["name"] = _strip_possessive(base.get("name"))
     return base
 
-# --------------------------
-# override merge helpers
-# --------------------------
-def _apply_flat_override(flat: "NewsFlatItem", ov) -> "NewsFlatItem":
-    if not ov:
-        return flat
-    if flat.type == "Funding":
-        flat.company   = ov.company   or flat.company
-        flat.amount    = ov.amount    or flat.amount
-        flat.round     = ov.round     or flat.round
-        flat.investors = ov.investors or flat.investors
-        flat.date      = ov.date      or flat.date
-        flat.month     = ov.month     or flat.month
-    else:
-        flat.name        = ov.name        or flat.name
-        flat.company     = ov.company     or flat.company
-        flat.designation = ov.designation or flat.designation
-        flat.date        = ov.date        or flat.date
-        flat.month       = ov.month       or flat.month
-    return flat
-
-def _apply_newsitem_override(item: "NewsItem", ov) -> "NewsItem":
-    if not ov:
-        return item
-    if item.category == "Funding":
-        item.company = ov.company or item.company
-    else:
-        item.person_name = ov.name or item.person_name
-        item.company     = ov.company or item.company
-        item.role        = ov.designation or item.role
-    return item
-
-# --------------------------
-# default range helper
-# --------------------------
 def _apply_default_range_if_missing(
     start_dt: Optional[datetime],
     end_dt: Optional[datetime],
@@ -476,39 +421,63 @@ def _apply_default_range_if_missing(
         end_dt = today_utc + timedelta(days=1)
     return start_dt, end_dt
 
-# --------------------------
-# Funding fetch (merge + dedupe)
-# --------------------------
-def _merge_funding(start_dt: Optional[datetime], end_dt: Optional[datetime]) -> List[dict]:
-    """
-    Always merge range-aware results with the unbounded fetch so we don't end up with 0–1 items
-    due to a stingy range fetcher. Then de-dupe by URL.
-    """
-    items: List[dict] = []
-
-    # range-aware slice (if available)
-    try:
-        if _fetch_funding_items_range and (start_dt or end_dt):
-            items.extend(_fetch_funding_items_range(start_dt, end_dt))
-    except Exception:
-        logger.exception("[news] funding range fetch failed; will fall back to full feed")
-
-    # full feed as backstop
-    try:
-        items.extend(fetch_funding_items())
-    except Exception:
-        logger.exception("[news] funding full fetch failed")
-
-    # de-dupe by URL (keep first)
+# ---------- funding helpers (robust fetching + fallbacks) ----------
+def _dedupe_by_url(items: List[dict]) -> List[dict]:
     seen = set()
-    deduped = []
-    for it in items:
+    out = []
+    for it in items or []:
         url = (it.get("url") or "").strip()
         if not url or url in seen:
             continue
         seen.add(url)
-        deduped.append(it)
-    return deduped
+        out.append(it)
+    return out
+
+def _live_fetch_funding(start_dt: Optional[datetime], end_dt: Optional[datetime]) -> List[dict]:
+    """Always try to fetch a healthy list of funding items for a window."""
+    # Priority 1: explicit range fetcher
+    if _fetch_funding_items_range:
+        try:
+            return _dedupe_by_url(_fetch_funding_items_range(start_dt, end_dt, max_pages=FUNDING_MAX_PAGES))
+        except Exception:
+            logger.exception("[news] range funding fetch failed, falling back")
+    # Priority 2: plain fetcher with large page budget (handle varying signatures)
+    for kwargs in (
+        {"max_pages": FUNDING_MAX_PAGES},
+        {},
+    ):
+        try:
+            items = fetch_funding_items(**kwargs)  # type: ignore[arg-type]
+            return _dedupe_by_url(items)
+        except TypeError:
+            continue
+        except Exception:
+            logger.exception("[news] plain funding fetch failed with %s", kwargs)
+    return []
+
+def _fresh_enough_cache() -> bool:
+    built = FUNDING_CACHE.get("built_at")
+    if not (USE_FUNDING_CACHE and isinstance(built, datetime)):
+        return False
+    age_min = (datetime.utcnow() - built).total_seconds() / 60.0
+    return age_min <= FUNDING_CACHE_MAX_AGE_MIN
+
+def _get_funding_items(start_dt: Optional[datetime], end_dt: Optional[datetime]) -> List[dict]:
+    """
+    Use cache if it's fresh and large enough; otherwise do a live fetch.
+    If the result looks too small, try a live fetch anyway.
+    """
+    items: List[dict] = []
+    if _fresh_enough_cache() and isinstance(FUNDING_CACHE.get("raw"), list):
+        items = FUNDING_CACHE["raw"]  # already deduped at build time
+    else:
+        items = _live_fetch_funding(start_dt, end_dt)
+
+    # Sanity: if too few items, do a second live fetch to avoid "single item" syndrome
+    if len(items) < FUNDING_MIN_EXPECTED:
+        items = _live_fetch_funding(start_dt, end_dt)
+
+    return _dedupe_by_url(items)
 
 # ================== ROUTES ==================
 @router.get("", response_model=dict)
@@ -534,7 +503,7 @@ def list_news(
 
     items: List[NewsItem] = []
 
-    # ---- People (load recent, then filter in Python) ----
+    # ---- People ----
     rows = list_recent(db, limit=20000)
     for r in rows:
         if not is_positive_movement(r.title or ""):
@@ -572,15 +541,20 @@ def list_news(
             source=r.source,
         )
         ov = ov_map.get(r.url or "")
-        items.append(_apply_newsitem_override(item, ov))
+        if ov:
+            # apply minimal override for card view
+            if item.category == "Funding":
+                item.company = ov.company or item.company
+            else:
+                item.person_name = ov.name or item.person_name
+                item.company = ov.company or item.company
+                item.role = ov.designation or item.role
+        items.append(item)
 
-    # ---- Funding (merge range + full feed, then filter by window) ----
-    if USE_FUNDING_CACHE and isinstance(FUNDING_CACHE.get("raw"), list):
-        funding_items = FUNDING_CACHE["raw"]
-    else:
-        funding_items = _merge_funding(start_dt, end_dt)
+    # ---- Funding (robust) ----
+    funding = _get_funding_items(start_dt, end_dt)
 
-    for it in funding_items or []:
+    for it in funding or []:
         pub_dt = _funding_pub_dt(it)
 
         # Enforce window only when we have a date. If an item has no date, keep it.
@@ -611,9 +585,11 @@ def list_news(
             source=it.get("source") or "yourstory",
         )
         ov = ov_map.get(it.get("url") or "")
-        items.append(_apply_newsitem_override(item, ov))
+        if ov:
+            item.company = ov.company or item.company
+        items.append(item)
 
-    # Newest → oldest (undated items at the end)
+    # Newest → oldest (undated items at bottom)
     items.sort(key=lambda x: (x.published_at is None, x.published_at or datetime.min), reverse=True)
     stats = get_funding_parse_stats(reset=True)
     window = {
@@ -630,13 +606,7 @@ def auto_sync_status(db: Session = Depends(get_db)):
         or _max_col(db, "created_at")
         or _max_col(db, "created")
     )
-    latest = None
-    lp = _as_datetime(latest_pub)
-    lc = _as_datetime(latest_cap)
-    if lp and lc:
-        latest = max(lp, lc)
-    else:
-        latest = lp or lc
+    latest = max(filter(None, [latest_pub, latest_cap])) if (latest_pub or latest_cap) else None
     total = db.query(Movement).count()
     return {
         "latest": (latest.isoformat() if latest else None),
@@ -652,13 +622,7 @@ def _auto_sync_once(db: Session, backstop_days: int = 14, max_pages: int = 12, s
         or _max_col(db, "created_at")
         or _max_col(db, "created")
     )
-    latest = None
-    lp = _as_datetime(latest_pub)
-    lc = _as_datetime(latest_cap)
-    if lp and lc:
-        latest = max(lp, lc)
-    else:
-        latest = lp or lc
+    latest = max(filter(None, [latest_pub, latest_cap])) if (latest_pub or latest_cap) else None
     cutoff = latest or (datetime.utcnow() - timedelta(days=backstop_days))
 
     scraped = scrape_paginated(
@@ -817,7 +781,7 @@ def get_news_table(
     ov_map: Dict[str, object] = {o.url: o for o in list_overrides_all(db, limit=10000)}
     table_with_keys: List[Tuple[Optional[datetime], NewsFlatItem]] = []
 
-    # ---- People ----
+    # ---- People (load recent, filter in Python) ----
     rows = list_recent(db, limit=20000)
     for r in rows:
         if not is_positive_movement(r.title or ""):
@@ -856,24 +820,26 @@ def get_news_table(
             type="In the News",
         )
         ov = ov_map.get(r.url or "")
-        row = _apply_flat_override(row, ov)
+        if ov:
+            row.company = ov.company or row.company
+            row.name = ov.name or row.name
+            row.designation = ov.designation or row.designation
+            row.date = ov.date or row.date
+            row.month = ov.month or row.month
         table_with_keys.append((basis, row))
 
-    # ---- Funding (merge + filter) ----
-    if USE_FUNDING_CACHE and isinstance(FUNDING_CACHE.get("raw"), list):
-        funding_items = FUNDING_CACHE["raw"]
-    else:
-        funding_items = _merge_funding(start_dt, end_dt)
+    # ---- Funding (robust) ----
+    funding = _get_funding_items(start_dt, end_dt)
 
-    for it in funding_items or []:
+    for it in funding or []:
         pub_dt = _funding_pub_dt(it)
 
+        # Apply window only if we have a date
         if pub_dt:
             if start_dt and pub_dt < start_dt:
                 continue
             if end_dt and pub_dt >= end_dt:
                 continue
-        # keep undated items
 
         if q:
             ql = q.lower()
@@ -904,7 +870,13 @@ def get_news_table(
             investors=parsed.investors,
         )
         ov = ov_map.get(it.get("url") or "")
-        row = _apply_flat_override(row, ov)
+        if ov:
+            row.company = ov.company or row.company
+            row.amount = ov.amount or row.amount
+            row.round = ov.round or row.round
+            row.investors = ov.investors or row.investors
+            row.date = ov.date or row.date
+            row.month = ov.month or row.month
         table_with_keys.append((pub_dt, row))
 
     table_with_keys.sort(key=lambda t: (t[0] is None, t[0] or datetime.min), reverse=True)
@@ -932,9 +904,8 @@ async def _rebuild_funding_cache() -> None:
     try:
         start_dt = datetime.utcnow() - timedelta(days=30)
         end_dt   = datetime.utcnow() + timedelta(days=1)
-        # merge range + full feed so cache isn't tiny
-        raw = _merge_funding(start_dt, end_dt)
-        FUNDING_CACHE["raw"] = raw or []
+        raw = _live_fetch_funding(start_dt, end_dt)
+        FUNDING_CACHE["raw"] = _dedupe_by_url(raw or [])
         FUNDING_CACHE["built_at"] = datetime.utcnow()
         logger.info("[news] funding_cache: rebuilt items=%s", len(FUNDING_CACHE["raw"]))
     except Exception:
@@ -1002,31 +973,9 @@ async def _people_refresh_loop() -> None:
         try:
             await asyncio.sleep(max(5, PEOPLE_SYNC_INTERVAL_MIN * 60))
             db = SessionLocal()
-            latest_pub = _max_col(db, "published_at")
-            latest_cap = (
-                _max_col(db, "captured_at")
-                or _max_col(db, "created_at")
-                or _max_col(db, "created")
-            )
-            latest = None
-            lp = _as_datetime(latest_pub)
-            lc = _as_datetime(latest_cap)
-            if lp and lc:
-                latest = max(lp, lc)
-            else:
-                latest = lp or lc
-            cutoff = latest or (datetime.utcnow() - timedelta(days=PEOPLE_SYNC_BACKSTOP_DAYS))
-            scraped = scrape_paginated(start_page=1, max_pages=12, stop_before=(cutoff - timedelta(days=1)))
-            added = 0
-            for it in scraped:
-                dt = _as_datetime(it.get("published_at"))
-                if dt is None or dt >= (cutoff - timedelta(days=1)):
-                    if not get_by_url(db, it["url"]):
-                        create(db, title=it["title"], url=it["url"], source="afaqs", published_at=dt)
-                        added += 1
-            db.commit()
+            res = _auto_sync_once(db, PEOPLE_SYNC_BACKSTOP_DAYS, 12, 1)
             db.close()
-            logger.info("[news] people auto-sync added=%s", added)
+            logger.info("[news] people auto-sync: %s", res)
         except asyncio.CancelledError:
             logger.info("[news] people auto-sync loop cancelled")
             return
