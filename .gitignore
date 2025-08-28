@@ -1,0 +1,92 @@
+# =========================
+# Node.js / Next.js
+# =========================
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Next.js build output
+.next/
+out/
+
+# TypeScript
+*.tsbuildinfo
+
+# =========================
+# Python / Backend
+# =========================
+# Virtual environments
+venv/
+.venv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg
+*.egg-info/
+.eggs/
+
+# Database files
+*.sqlite3
+*.db
+backend/app.db
+backend/people_movements.db
+
+# Data folders
+backend/data/
+backend/app/.data/
+backend/.data/
+
+# Logs
+*.log
+*.log.*
+logs/
+pids
+*.pid
+*.seed
+*.pid.lock
+
+# Coverage / test
+.coverage
+.tox/
+.nox/
+.pytest_cache/
+.mypy_cache/
+.pyre/
+coverage/
+
+# =========================
+# Env files
+# =========================
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# =========================
+# Build & misc
+# =========================
+dist/
+.cache/
+.tmp/
+*.swp
+
+# IDE / Editor
+.vscode/
+.idea/
+*.iml
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+
+# =========================
+# Custom project
+# =========================
+.data/
+combined_sources*.txt
