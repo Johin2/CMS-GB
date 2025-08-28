@@ -1,4 +1,3 @@
-# backend/app/main.py
 import os
 from pathlib import Path
 from fastapi import FastAPI
@@ -50,7 +49,7 @@ if not allowed_origins:
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
-    allow_credentials=False,  # set True only if you share cookies across origins
+    allow_credentials=False,  # True only if sharing cookies across origins
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"],
     allow_headers=["*"],
 )

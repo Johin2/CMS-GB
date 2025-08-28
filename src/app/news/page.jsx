@@ -1,12 +1,10 @@
-// app/news/page.jsx
 'use client';
 
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Calendar, Search, ChevronDown, ChevronRight, Check, Pencil, X, Save, RotateCcw } from 'lucide-react';
 
 /* ---------------------------
-   API helper
-   Always call the Next.js proxy at /api
+   API helper – always hit same-origin /api
 ---------------------------- */
 const API_BASE = '/api';
 
@@ -22,7 +20,7 @@ async function apiFetch(path, init) {
 }
 
 /* ---------------------------
-   Text helpers (token aware)
+   Token-aware text helpers
 ---------------------------- */
 const tok = (s) =>
   (s || '')
@@ -504,7 +502,7 @@ function ExternalIcon() {
   );
 }
 
-/* -------- Dropdown components (unchanged structure) -------- */
+/* -------- Dropdown components -------- */
 function BucketDropdown({ menu, value, onChange, buttonLabel }) {
   const [open, setOpen] = useState(false);
   const [hoverPath, setHoverPath] = useState([]);
@@ -575,7 +573,7 @@ function MenuLevel({ items, level, leftOffset, hoverPath, onHoverPathChange, onS
                   else if (item.key) onSelectBucket(item.key);
                 }}
                 className={
-                  'group flex w-full items-center justify-between rounded-md px-3 py-2 text-left text-sm hover:bg-white/10 ' +
+                  'group flex w-full items-center justify-between rounded-md px-3 py-2 text-left text-sm hover:bg白/10 ' +
                   ((item.key && !hasChildren && isActiveBucket(item.key)) || (isFundingRoundChild && isActiveRound(item.key)) ? 'bg-white/10' : '')
                 }
               >
