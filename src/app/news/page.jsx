@@ -6,18 +6,13 @@ import { Calendar, Search, ChevronDown, ChevronRight, Check, Pencil, X, Save, Ro
 
 /* ---------------------------
    API helper
+   - Prefer proxy: /api/cms/api → forwards to backend
+   - If NEXT_PUBLIC_API_BASE is set (absolute URL), use it directly
 ---------------------------- */
 const API_BASE = (() => {
-  const env = process.env.NEXT_PUBLIC_API_BASE;
-  // If provided and looks like an absolute URL, normalize and ensure it ends with /api
-  if (env && /^https?:\/\//i.test(env)) {
-    const trimmed = env.replace(/\/+$/, '');
-    return trimmed.endsWith('/api') ? trimmed : `${trimmed}/api`;
-  }
-  // Fall back to same-origin proxy (/api) in Next.js
-  if (typeof window !== 'undefined') return `${window.location.origin}/api`;
-  // Dev fallback
-  return 'http://127.0.0.1:8000/api';
+  const env = (process.env.NEXT_PUBLIC_API_BASE || '').trim();
+  if (env && /^https?:\/\//i.test(env)) return env.replace(/\/+$/, ''); // assume full base provided by env
+  return '/api/cms/api'; // proxy route base (you’ve already added app/api/cms/[...path]/route.js)
 })();
 
 const joinUrl = (base, path) =>
@@ -85,6 +80,7 @@ function monthFromDateString(s) {
    Buckets (token-based rules)
 ---------------------------- */
 const CORE_BUCKETS = [
+  { key: 'all', label: 'All', match: () => true }, // default view shows everything
   {
     key: 'ceo',
     label: 'CEO',
@@ -142,17 +138,17 @@ const CORE_BUCKETS = [
   },
 ];
 
-// “Others” = anything that does NOT match any of the above
+// “Others” = anything that does NOT match any of the *specific* buckets (exclude "All")
 const BUCKETS = [
   ...CORE_BUCKETS,
   {
     key: 'others',
     label: 'Others',
-    match: (r) => !CORE_BUCKETS.some((b) => b.match(r)),
+    match: (r) => !CORE_BUCKETS.slice(1).some((b) => b.match(r)), // slice(1) skips 'all'
   },
 ];
 
-const DEFAULT_BUCKET = BUCKETS[0].key;
+const DEFAULT_BUCKET = 'all';
 
 /* ---------------------------
    Funding rounds
@@ -182,6 +178,7 @@ function normalizeRound(s) {
    Nested menu config
 ---------------------------- */
 const NESTED_BUCKET_MENU = [
+  { key: 'all', label: 'All' },
   {
     label: 'Leadership',
     children: [
@@ -235,7 +232,8 @@ export default function NewsPage() {
       if (q) params.set('q', q);
       if (from) params.set('from', from);
       if (to) params.set('to', to);
-      const data = await apiFetch(`/news/table?${params.toString()}`);
+      const query = params.toString();
+      const data = await apiFetch(`/news/table${query ? `?${query}` : ''}`);
       setItems(Array.isArray(data?.items) ? data.items : []);
     } catch (e) {
       console.error(e);
@@ -376,7 +374,7 @@ export default function NewsPage() {
       <div className="mx-auto max-w-7xl px-6 pb-16 pt-8">
         <h1 className="text-3xl font-semibold tracking-tight">News</h1>
         <p className="mt-2 text-sm text-white/60">
-          Use the nested dropdown to filter buckets: Leadership (CEO, CMO, CXO, Director, Country Head),
+          Use the nested dropdown to filter buckets: All, Leadership (CEO, CMO, CXO, Director, Country Head),
           Company (Fundings with round types, Campaign), Others. Click <em>Edit</em> to fix data inline.
         </p>
 
